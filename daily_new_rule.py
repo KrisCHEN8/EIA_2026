@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 # Use paths relative to this script's directory
 base_dir = Path(__file__).resolve().parent
 
-weather_file = base_dir / "2024_weather.csv"
-mix_file = base_dir / "four_category.xlsx"
-output_file = base_dir / "daily_priority_dispatch_2024.csv"
+weather_file = base_dir / "./DH production mix/2024_weather.csv"
+mix_file = base_dir / "./DH production mix/four_category.xlsx"
+output_file = base_dir / "./DH production mix/daily_priority_dispatch_2024.csv"
 
 year = 2024
 
