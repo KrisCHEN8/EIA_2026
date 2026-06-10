@@ -146,9 +146,6 @@ def monthly_to_daily(
             .reset_index()
         )
 
-    # NOTE: do NOT filter by year here — the monthly_df may span multiple
-    # years, and the dispatch loop already matches by (year, month).
-
     weather["month"] = weather["date"].dt.month
     weather["year"] = weather["date"].dt.year
 
