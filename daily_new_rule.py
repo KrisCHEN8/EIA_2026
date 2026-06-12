@@ -340,11 +340,11 @@ print(f"\nResults saved to: {output_file}")
 
 
 # ==================================================
-# 7. Discrete stacked bar plot for selected period
+# 7. Continuous stacked area plot for selected period
 # ==================================================
 
-start_date = "2024-07-01"
-end_date = "2024-07-31"
+start_date = "2024-01-01"
+end_date = "2024-12-31"
 
 plot_df = daily[
     (daily["date"] >= start_date) &
@@ -362,37 +362,30 @@ energy_cols = [
 
 plt.figure(figsize=(15, 6))
 
-bottom = None
+# Use stacked area plot for continuous daily composition
+plt.stackplot(
+    plot_df["date"],
+    [plot_df[col] for col in energy_cols],
+    labels=energy_cols,
+    alpha=0.85
+)
 
-for col in energy_cols:
-    if bottom is None:
-        plt.bar(
-            plot_df["date"],
-            plot_df[col],
-            label=col
-        )
-        bottom = plot_df[col].copy()
-    else:
-        plt.bar(
-            plot_df["date"],
-            plot_df[col],
-            bottom=bottom,
-            label=col
-        )
-        bottom = bottom + plot_df[col]
-
+# Plot a clean dashed line for the total daily production
 plt.plot(
     plot_df["date"],
     plot_df["daily_total_mwh"],
-    marker="o",
-    linewidth=1.5,
+    color="black",
+    linestyle="--",
+    linewidth=1.2,
     label="Total daily production"
 )
 
 plt.xlabel("Date")
 plt.ylabel("Daily production (MWh)")
-plt.title(f"Discrete daily energy mix from {start_date} to {end_date}")
+plt.title(f"Daily energy mix from {start_date} to {end_date}")
 plt.legend(loc="upper left")
 plt.grid(True, axis="y", alpha=0.3)
 plt.tight_layout()
+plt.savefig("./figs/daily_stacked_area.png", dpi=300)
 plt.show()
+
