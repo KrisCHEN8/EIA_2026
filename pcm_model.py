@@ -1,12 +1,12 @@
 class PCMModel:
-    def __init__(self, volume_liters=None, mass_kg=None):
+    def __init__(self, volume_liters=None, mass_kg=None, initial_temperature=20.0):
         # Physical Properties from Rubitherm RT65
-        self.cp_standard = 2000.0  # 2 kJ/kg·K baseline specific heat
-        self.T_solid = 58.0        # Start of melting zone
-        self.T_liquid = 65.0       # End of melting zone
+        self.cp_standard = 2000.0     # 2 kJ/kg·K baseline specific heat (J/kg·K)
+        self.T_solid = 58.0           # Start of melting zone (°C)
+        self.T_liquid = 65.0          # End of melting zone (°C)
         self.dT = self.T_liquid - self.T_solid
 
-        # Combined Latent + Sensible heat capacity inside the broader window
+        # Combined Latent + Sensible heat capacity inside the broader window (J/kg)
         self.total_transition_energy = 150000.0 
         
         # Determine Mass (M_pcm)
@@ -15,38 +15,102 @@ class PCMModel:
         elif volume_liters:
             self.mass = volume_liters * 0.83 
         else:
-            self.mass = 60.2   # kg, from experimental data
+            self.mass = 60.2   # kg
 
-    def get_enthalpy(self, T):
-        """
-        Calculates total enthalpy (J/kg) at temperature T (°C)
-        using a continuous simplified linear approximation.
-        """
-        # 1. Fully Solid Phase
-        if T < self.T_solid:
-            return self.cp_standard * T
+        # Effective specific heat during phase change
+        self.cp_phase_change = self.total_transition_energy / self.dT
+        
+        # Initial temperature
+        self.T = initial_temperature
 
-        # 2. Phase Change Transition Region (Linear Enthalpy Ramp)
-        elif self.T_solid <= T <= self.T_liquid:
-            h_solid = self.cp_standard * self.T_solid
-            fraction = (T - self.T_solid) / self.dT
-            return h_solid + (fraction * self.total_transition_energy)
-
-        # 3. Fully Liquid Phase
+    def get_effective_cp(self, T):
+        """Returns effective specific heat capacity based on the current temperature."""
+        if self.T_solid <= T <= self.T_liquid:
+            return self.cp_phase_change
         else:
-            h_liquid = (self.cp_standard * self.T_solid) + self.total_transition_energy
-            return h_liquid + self.cp_standard * (T - self.T_liquid)
+            return self.cp_standard
 
-    def get_effective_cp(self, T_pcm):
+
+class PCMStorageTank:
+    def __init__(self, water_mass_kg=150.0, pcm_mass_kg=60.2):
+        self.M_water = water_mass_kg
+        self.cp_water = 4184.0   # J/kg·K
+        self.T_water = 20.0  # Initial water tank temperature (°C)
+        
+        self.pcm = PCMModel(mass_kg=pcm_mass_kg, initial_temperature=20.0)
+        
+        # Heat transfer coefficient * surface area coupling water and PCM tube (W/K)
+        self.UA_pcm = 50.0
+        
+        # Ambient loss coefficient (W/K) and ambient temperature
+        self.UA_loss = 2.0
+        self.T_amb = 22.0
+
+    def step(self, m_dot, T_in, dt):
         """
-        Returns dynamic specific heat capacity based on RT65 data.
+        Advances the state of the tank by one time step.
+        
+        Args:
+            m_dot: Mass flow rate through the storage (kg/s)
+                    Same flow enters from heat exchanger and exits to building.
+            T_in: Temperature of water entering from heat exchanger (°C)
+            dt: Time step (seconds)
+        
+        Returns:
+            T_out: Temperature of water leaving to the building (= T_water, well mixed)
         """
-        if self.T_solid <= T_pcm <= self.T_liquid:
-            return self.total_transition_energy / self.dT
-        return self.cp_standard
+        # Current properties
+        cp_pcm_eff = self.pcm.get_effective_cp(self.pcm.T)
+        
+        # Heat exchange between tank water and PCM (W)
+        Q_pcm = self.UA_pcm * (self.T_water - self.pcm.T)
+        
+        # Heat loss to ambient environment (W)
+        Q_loss = self.UA_loss * (self.T_water - self.T_amb)
+
+        # Energy carried IN by hot water from heat exchanger (W)
+        Q_in = m_dot * self.cp_water * T_in
+
+        # Energy carried OUT by water leaving to building at tank temperature (W)
+        Q_out = m_dot * self.cp_water * self.T_water
+
+        # Total energy balance on the tank water (W)
+        dT_water_dt = (Q_in - Q_out - Q_pcm - Q_loss) / (self.M_water * self.cp_water)
+        dT_pcm_dt = Q_pcm / (self.pcm.mass * cp_pcm_eff)
+
+        # Update states
+        self.T_water += dT_water_dt * dt
+        self.pcm.T += dT_pcm_dt * dt
+
+        # The temperature of water leaving the tank to the building is the tank temperature (well mixed)
+        T_out = self.T_water
+
+        return T_out
+
 
 if __name__ == "__main__":
-    pcm = PCMModel()
-    print(f"Enthalpy at 55°C (Solid): {pcm.get_enthalpy(55.0):,.1f} J/kg")
-    print(f"Enthalpy at 63°C (Mid-melt): {pcm.get_enthalpy(63.0):,.1f} J/kg")
-    print(f"Effective Cp during phase change: {pcm.get_effective_cp(63.0):,.1f} J/kg·K")
+    tank = PCMStorageTank(water_mass_kg=100.0, pcm_mass_kg=60.2)
+    
+    dt = 10.0          # Time step (seconds)
+    hours = 8          # hours simulation
+    total_time = hours * 3600  # seconds simulation
+    time_steps = int(total_time / dt)
+    
+    # Supply side (from district heating via heat exchanger)
+    m_dot_supply = 0.05    # kg/s
+    T_supply = 75.0        # °C
+    
+    print(f"{'Time (mins)':<12}{'T_water (°C)':<15}{'T_pcm (°C)':<14}{'T_to_bldg (°C)':<16}")
+    print("-" * 57)
+    
+    for step in range(time_steps):
+        T_out = tank.step(
+            m_dot=m_dot_supply,
+            T_in=T_supply,
+            dt=dt
+        )
+        
+        # Print logs every 15 minutes
+        if (step * dt) % 900 == 0:
+            mins = int((step * dt) / 60)
+            print(f"{mins:<12}{tank.T_water:<15.2f}{tank.pcm.T:<14.2f}{T_out:<16.2f}")
