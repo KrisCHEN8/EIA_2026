@@ -1,23 +1,26 @@
 class PCMModel:
-    def __init__(self):
-        # Properties from Table 1 for K1 PCM
-        self.T_m = 25.0         # Baseline melting temperature (°C)
-        self.dT = 2.0           # Melting temperature range (°C)
-        self.L = 204000.0       # Latent heat (J/kg)
-        self.Q_sensible = 26000.0 # Sensible heat inside the range (J/kg)
+    def __init__(self, volume_liters=None, mass_kg=None):
+        # Physical Properties from Rubitherm RT65
+        self.cp_standard = 2000.0  # 2 kJ/kg·K baseline specific heat
+        self.T_solid = 58.0        # Start of melting zone
+        self.T_liquid = 65.0       # End of melting zone
+        self.dT = self.T_liquid - self.T_solid
 
-        # Phase change temperature boundaries (half-range of ±1°C)
-        self.T_solid = self.T_m - (self.dT / 2.0)   # 24.0°C
-        self.T_liquid = self.T_m + (self.dT / 2.0)  # 26.0°C
-
-        # Constant sensible specific heat capacity (J/kg·K) outside phase change
-        # (Assuming standard baseline cp ~ 2000 J/kg·K for paraffin when fully solid/liquid)
-        self.cp_standard = 2000.0 
+        # Combined Latent + Sensible heat capacity inside the broader window
+        self.total_transition_energy = 150000.0 
+        
+        # Determine Mass (M_pcm)
+        if mass_kg:
+            self.mass = mass_kg
+        elif volume_liters:
+            self.mass = volume_liters * 0.83 
+        else:
+            self.mass = 60.2   # kg, from experimental data
 
     def get_enthalpy(self, T):
         """
         Calculates total enthalpy (J/kg) at temperature T (°C)
-        using the simplified linear approximation.
+        using a continuous simplified linear approximation.
         """
         # 1. Fully Solid Phase
         if T < self.T_solid:
@@ -27,27 +30,23 @@ class PCMModel:
         elif self.T_solid <= T <= self.T_liquid:
             h_solid = self.cp_standard * self.T_solid
             fraction = (T - self.T_solid) / self.dT
-            # Total energy injection in this zone includes both latent and phase-change sensible heat
-            total_transition_energy = self.L + self.Q_sensible
-            return h_solid + (fraction * total_transition_energy)
+            return h_solid + (fraction * self.total_transition_energy)
 
         # 3. Fully Liquid Phase
         else:
-            h_liquid = (self.cp_standard * self.T_solid) + self.L + self.Q_sensible
+            h_liquid = (self.cp_standard * self.T_solid) + self.total_transition_energy
             return h_liquid + self.cp_standard * (T - self.T_liquid)
 
-    def get_effective_cp(self, T):
+    def get_effective_cp(self, T_pcm):
         """
-        Returns the effective specific heat capacity (J/kg·K), 
-        which peaks inside the melting range due to latent heat absorption.
+        Returns dynamic specific heat capacity based on RT65 data.
         """
-        if self.T_solid <= T <= self.T_liquid:
-            # Distributed energy capacity across the range
-            return (self.L + self.Q_sensible) / self.dT
+        if self.T_solid <= T_pcm <= self.T_liquid:
+            return self.total_transition_energy / self.dT
         return self.cp_standard
 
 if __name__ == "__main__":
     pcm = PCMModel()
-    print(f"Enthalpy at 23°C (Solid): {pcm.get_enthalpy(23.0):,.1f} J/kg")
-    print(f"Enthalpy at 25°C (Mid-melt): {pcm.get_enthalpy(25.0):,.1f} J/kg")
-    print(f"Effective Cp during phase change: {pcm.get_effective_cp(25.0):,.1f} J/kg·K")
+    print(f"Enthalpy at 55°C (Solid): {pcm.get_enthalpy(55.0):,.1f} J/kg")
+    print(f"Enthalpy at 63°C (Mid-melt): {pcm.get_enthalpy(63.0):,.1f} J/kg")
+    print(f"Effective Cp during phase change: {pcm.get_effective_cp(63.0):,.1f} J/kg·K")
