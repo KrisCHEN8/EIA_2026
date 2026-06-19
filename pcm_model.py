@@ -59,6 +59,9 @@ class PCMStorageTank:
         Returns:
             T_out: Temperature of water leaving to the building (= T_water, well mixed)
         """
+        # The temperature of water leaving the tank to the building is the tank temperature (well mixed)
+        T_out = self.T_water
+
         # Current properties
         cp_pcm_eff = self.pcm.get_effective_cp(self.pcm.T)
         
@@ -68,10 +71,10 @@ class PCMStorageTank:
         # Heat loss to ambient environment (W)
         Q_loss = self.UA_loss * (self.T_water - self.T_amb)
 
-        # Energy carried IN by hot water from heat exchanger (W)
+        # Energy carried in by hot water from heat exchanger (W)
         Q_in = m_dot * self.cp_water * T_in
 
-        # Energy carried OUT by water leaving to building at tank temperature (W)
+        # Energy carried out by water leaving to building at tank temperature (W)
         Q_out = m_dot * self.cp_water * self.T_water
 
         # Total energy balance on the tank water (W)
@@ -82,14 +85,11 @@ class PCMStorageTank:
         self.T_water += dT_water_dt * dt
         self.pcm.T += dT_pcm_dt * dt
 
-        # The temperature of water leaving the tank to the building is the tank temperature (well mixed)
-        T_out = self.T_water
-
         return T_out
 
 
 if __name__ == "__main__":
-    tank = PCMStorageTank(water_mass_kg=100.0, pcm_mass_kg=60.2)
+    tank = PCMStorageTank(water_mass_kg=50.0, pcm_mass_kg=60.2)
     
     dt = 10.0          # Time step (seconds)
     hours = 8          # hours simulation
@@ -102,14 +102,14 @@ if __name__ == "__main__":
     
     print(f"{'Time (mins)':<12}{'T_water (°C)':<15}{'T_pcm (°C)':<14}{'T_to_bldg (°C)':<16}")
     print("-" * 57)
-    
+
     for step in range(time_steps):
         T_out = tank.step(
             m_dot=m_dot_supply,
             T_in=T_supply,
             dt=dt
         )
-        
+
         # Print logs every 15 minutes
         if (step * dt) % 900 == 0:
             mins = int((step * dt) / 60)
