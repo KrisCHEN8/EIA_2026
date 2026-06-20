@@ -8,7 +8,7 @@ def heating_curve(
     t_supply_max=110.0,
     t_out_summer=17.0,
     t_out_dot=-20.0,
-    noise_variance=5.0,
+    noise_variance=3.0,
     seed=None,
 ):
     """

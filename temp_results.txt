@@ -1,7 +1,0 @@
-=== Threshold Evaluation ===
-Threshold: 80.0 MW | Peak: 249.90 MW | Fossil: 46.796 GWh | LF: 29.99%
-Threshold: 90.0 MW | Peak: 249.90 MW | Fossil: 47.437 GWh | LF: 30.00%
-Threshold: 100.0 MW | Peak: 249.90 MW | Fossil: 48.029 GWh | LF: 30.00%
-Threshold: 110.0 MW | Peak: 249.90 MW | Fossil: 48.510 GWh | LF: 30.00%
-Threshold: 120.0 MW | Peak: 249.90 MW | Fossil: 48.797 GWh | LF: 30.01%
-Threshold: 140.0 MW | Peak: 249.90 MW | Fossil: 49.105 GWh | LF: 30.01%

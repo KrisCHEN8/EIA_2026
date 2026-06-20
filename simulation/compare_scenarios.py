@@ -38,13 +38,13 @@ SOURCE_COLORS = {
 }
 SCENARIO_COLORS = {
     "Baseline (no TES/DSM)": "#E57373",
-    "TES only": "#64B5F6",
-    "TES + DSM": "#81C784",
+    "Water Tank + DSM": "#64B5F6",
+    "PCM Storage + DSM": "#81C784",
 }
 SCENARIO_SHORT = {
     "Baseline (no TES/DSM)": "Baseline",
-    "TES only": "TES",
-    "TES + DSM": "TES+DSM",
+    "Water Tank + DSM": "Water Tank",
+    "PCM Storage + DSM": "PCM",
 }
 
 
@@ -53,8 +53,8 @@ def load_results():
     scenarios = {}
     for fname, label in [
         ("baseline_results.csv", "Baseline (no TES/DSM)"),
-        ("tes_results.csv", "TES only"),
-        ("dsm_results.csv", "TES + DSM"),
+        ("tes_results.csv", "Water Tank + DSM"),
+        ("dsm_results.csv", "PCM Storage + DSM"),
     ]:
         path = RESULTS_DIR / fname
         if path.exists():
@@ -169,8 +169,7 @@ def plot_return_temperature_distribution(scenarios: dict):
 
 def plot_monthly_production_mix(scenarios: dict):
     """Monthly production mix stacked bars for each scenario."""
-    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    month_labels = ["Jan", "Feb", "Mar"]
 
     n_scenarios = len(scenarios)
     fig, axes = plt.subplots(n_scenarios, 1, figsize=(14, 5 * n_scenarios), sharex=True)
@@ -185,8 +184,8 @@ def plot_monthly_production_mix(scenarios: dict):
         df_copy["month"] = df_copy["date"].dt.month
         monthly = df_copy.groupby("month")[PRIORITY_SOURCES].sum() / 1000  # MWh → GWh
 
-        bottom = np.zeros(12)
-        x = np.arange(1, 13)
+        bottom = np.zeros(3)
+        x = np.arange(1, 4)
 
         for src in PRIORITY_SOURCES:
             vals = [monthly.loc[m, src] if m in monthly.index else 0 for m in x]
@@ -220,11 +219,10 @@ def plot_chp_efficiency(scenarios: dict):
     fig.patch.set_facecolor("#1a1a2e")
     ax.set_facecolor("#16213e")
 
-    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    month_labels = ["Jan", "Feb", "Mar"]
 
     width = 0.25
-    x = np.arange(1, 13)
+    x = np.arange(1, 4)
 
     for i, (name, df) in enumerate(scenarios.items()):
         df_copy = df.copy()
