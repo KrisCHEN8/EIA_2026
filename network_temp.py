@@ -19,9 +19,7 @@ def heating_curve(
     t_supply_min: Supply temperature at/above the summer threshold [degC].
     t_supply_max: Supply temperature at/below the design outdoor temperature [degC].
     t_out_summer: Outdoor temperature above which the curve flattens to t_supply_min [degC].
-    t_out_dot: Dimensioning outdoor temperature (design point) [degC].
-    noise_variance: Variance of the random noise added to the supply temperature (mean=0) [degC^2].
-    seed: Seed for the random number generator.
+    t_out_dot: design point design temp [degC].
 
     Returns
         Primary side supply temperature in degC.
