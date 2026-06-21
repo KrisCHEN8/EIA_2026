@@ -14,7 +14,7 @@ load_2019.index = pd.to_datetime(load_2019["DateTime"])
 load = load_2019["Bromstad (W/m2)"] * 1350 * 0.001   # kW
 temperature = weather_2019["Air temperature (°C)"]
 
-# Heating Curve: Quadratic Regression (temperature < 21°C only)
+# Heating Curve for temperature less than 21°C
 df = pd.DataFrame({"temperature": temperature, "load": load}).dropna()
 df_heating = df[df["temperature"] < 21]
 

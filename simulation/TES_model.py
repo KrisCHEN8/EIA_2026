@@ -107,7 +107,6 @@ class WaterTank:
 
         Args:
             m_dot: Mass flow rate through the storage (kg/s)
-                    Same flow enters from heat exchanger and exits to building.
             T_in: Temperature of water entering from heat exchanger (°C)
             dt: Time step (seconds)
         
