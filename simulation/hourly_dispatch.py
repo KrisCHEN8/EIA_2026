@@ -1,14 +1,5 @@
 """
-Hourly Production Dispatch
-==========================
 Re-dispatches the daily production mix to hourly resolution.
-
-The daily dispatch data gives us daily MWh per source. This module
-distributes each daily total across 24 hours following the hourly
-network demand profile shape, while respecting the priority order.
-
-Priority order: Waste heat → Electricity → Biomass → Fossil fuel
-(same as daily_new_rule.py but at hourly resolution)
 """
 
 import numpy as np
@@ -37,14 +28,10 @@ def distribute_daily_to_hourly(
     the demand profile shape.
 
     Parameters
-    ----------
-    daily_dispatch : pd.DataFrame
-        Daily dispatch with columns: date, Waste heat, Electricity, Biomass, Fossil fuel, daily_total_mwh.
-    hourly_demand : pd.DataFrame
-        Hourly demand with columns: date, network_load_mw (or similar).
+    daily_dispatch: Daily dispatch with columns: date, Waste heat, Electricity, Biomass, Fossil fuel, daily_total_mwh.
+    hourly_demand: Hourly demand with columns: date, network_load_mw (or similar).
 
     Returns
-    -------
     pd.DataFrame with hourly production mix.
     """
     hourly = hourly_demand.copy()
@@ -75,19 +62,17 @@ def distribute_daily_to_hourly(
         row_data = pd.DataFrame({"date": day_group["date"].values})
         row_data["hourly_demand_mw"] = demand.ravel()
 
-        # Distribute each source by the hourly weight
-        remaining_demand_mwh = demand * 1.0  # MW × 1h = MWh per hour
+        # MW to MWh
+        remaining_demand_mwh = demand * 1.0
 
         for src in PRIORITY_SOURCES:
             daily_src_mwh = daily_row[src]
             # Distribute proportionally
             hourly_src = weights * daily_src_mwh
-            # But cap at remaining demand per hour
             hourly_src = np.minimum(hourly_src, remaining_demand_mwh)
             row_data[src] = hourly_src
             remaining_demand_mwh = remaining_demand_mwh - hourly_src
 
-        # Any leftover goes to fossil
         row_data["Fossil fuel"] = row_data["Fossil fuel"] + np.maximum(remaining_demand_mwh, 0)
 
         row_data["hourly_total_mwh"] = sum(row_data[src] for src in PRIORITY_SOURCES)
@@ -107,7 +92,7 @@ def redispatch_for_modified_load(
     dates: pd.DatetimeIndex,
 ) -> pd.DataFrame:
     """
-    Re-dispatch production for a modified (DSM) load profile.
+    Re-dispatch production for a modified load profile.
 
     The key insight: when DSM reduces peak demand, the marginal source
     (fossil fuel, being last in priority) is what gets reduced. When DSM
@@ -115,19 +100,14 @@ def redispatch_for_modified_load(
     already running can serve more — or if waste heat capacity is maxed,
     electricity/biomass serve the extra.
 
-    Parameters
-    ----------
-    daily_dispatch : pd.DataFrame
+    daily_dispatch: pd.DataFrame
         Original daily dispatch.
-    original_hourly_demand_mw : np.ndarray
-        Original hourly demand (MW).
-    modified_hourly_demand_mw : np.ndarray
+    original_hourly_demand_mw: Original hourly demand (MW).
+    modified_hourly_demand_mw: Modified hourly demand after DSM (MW).
         Modified hourly demand after DSM (MW).
-    dates : pd.DatetimeIndex
-        Timestamps for each hour.
+    dates : Timestamps for each hour.
 
     Returns
-    -------
     pd.DataFrame with re-dispatched hourly production.
     """
     daily = daily_dispatch.copy()
@@ -165,14 +145,11 @@ def redispatch_for_modified_load(
         for src in PRIORITY_SOURCES:
             row_data[src] = weights * daily_row[src]
 
-        # Adjust for demand changes:
-        # Reduction → cut fossil first, then biomass, then electricity
-        # Increase → add from the cheapest available source
         for i in range(n):
             delta = demand_change_mwh[i]
 
             if delta < 0:
-                # Demand decreased: cut from marginal (fossil → biomass → electricity)
+                # Demand decreased: cut from marginal
                 remaining_cut = abs(delta)
                 for src in reversed(PRIORITY_SOURCES):
                     if src == "Waste heat":
@@ -205,19 +182,3 @@ def redispatch_for_modified_load(
     if not results:
         return pd.DataFrame()
     return pd.concat(results, ignore_index=True)
-
-
-if __name__ == "__main__":
-    from network_scaling import load_and_scale_building_load
-
-    daily = load_daily_dispatch(2024)
-    hourly = load_and_scale_building_load(2024)
-    hourly = hourly.rename(columns={"network_load_mw": "network_load_mw"})
-
-    result = distribute_daily_to_hourly(daily, hourly)
-    print(f"Hourly dispatch: {len(result)} rows")
-    print(f"Annual totals (MWh):")
-    for src in PRIORITY_SOURCES:
-        print(f"  {src}: {result[src].sum():,.0f}")
-    print(f"  Total: {result['hourly_total_mwh'].sum():,.0f}")
-    print(f"  (Daily dispatch total: {daily['daily_total_mwh'].sum():,.0f})")

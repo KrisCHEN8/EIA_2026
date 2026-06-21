@@ -1,18 +1,3 @@
-"""
-Main Simulation Runner
-======================
-Runs three scenarios for the full year 2024:
-    1. Baseline — no TES, no DSM
-    2. Water Tank + DSM — physical 1000L Water Tank storage with off-peak charging and peak discharging
-    3. PCM Storage + DSM — physical 1000L-equivalent PCM Storage Tank with matching controls
-
-For each scenario, computes:
-    - Hourly network demand profile
-    - Return temperatures via substation model coupled with storage states
-    - Hourly production dispatch
-    - CHP efficiency metrics
-"""
-
 import sys
 import numpy as np
 import pandas as pd
@@ -27,6 +12,7 @@ from simulation.network_scaling import load_and_scale_building_load, compute_sca
 from simulation.substation_model import Substation, load_supply_temperature
 from simulation.chp_model import CHPModel, FlueGasCondensationModel
 from simulation.hourly_dispatch import load_daily_dispatch, distribute_daily_to_hourly, redispatch_for_modified_load
+from simulation.TES_model import WaterTank, PCMStorageTank
 
 YEAR = 2024
 OUTPUT_DIR = BASE_DIR / "simulation" / "results"
@@ -34,63 +20,115 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 PRIORITY_SOURCES = ["Waste heat", "Electricity", "Biomass", "Fossil fuel"]
 CP_WATER = 4.184  # kJ/(kg·K)
+ETA_HEX = 0.70     # HEX efficiency
+
+
+def compute_secondary_return_temperature(Q_demand_kw, T_sec_supply, m_dot_sec):
+    if m_dot_sec > 0:
+        T_sec_return = T_sec_supply - Q_demand_kw / (m_dot_sec * CP_WATER)
+    else:
+        T_sec_return = T_sec_supply
+    return np.clip(T_sec_return, 25.0, T_sec_supply)
+
+
+def find_required_T_in(tank, m_dot, T_target, dt_sub, n_steps):
+    """
+    Solve for the tank inlet temperature (T_in) that will result in the
+    final tank water temperature reaching T_target (55.0°C) after n_steps.
+    """
+    if m_dot <= 0:
+        return T_target
+
+    T_water_init = tank.T_water
+    T_pcm_init = getattr(tank.pcm, "T", None) if hasattr(tank, "pcm") else None
+
+    def run_sim(T_in_candidate):
+        tank.T_water = T_water_init
+        if hasattr(tank, "pcm") and T_pcm_init is not None:
+            tank.pcm.T = T_pcm_init
+        for _ in range(n_steps):
+            tank.step(m_dot=m_dot, T_in=T_in_candidate, dt=dt_sub)
+        return tank.T_water
+
+    low = 25.0
+    high = 150.0
+
+    y_low = run_sim(low)
+    y_high = run_sim(high)
+
+    if y_low >= T_target:
+        T_in_opt = low
+    elif y_high <= T_target:
+        T_in_opt = high
+    else:
+        for _ in range(12):
+            mid = (low + high) / 2.0
+            y_mid = run_sim(mid)
+            if y_mid < T_target:
+                low = mid
+            else:
+                high = mid
+        T_in_opt = (low + high) / 2.0
+
+    tank.T_water = T_water_init
+    if hasattr(tank, "pcm") and T_pcm_init is not None:
+        tank.pcm.T = T_pcm_init
+
+    return T_in_opt
+
 
 
 def run_scenario(
     scenario_name: str,
     hourly_demand: pd.DataFrame,
-    supply_temps: pd.DataFrame,
+    supply_temps: pd.Series,
     weather: pd.DataFrame,
     daily_dispatch: pd.DataFrame,
-) -> pd.DataFrame:
+):
     """
     Run a single scenario with physical hour-by-hour storage integration.
 
-    Parameters
-    ----------
-    scenario_name : str
-    hourly_demand : pd.DataFrame with 'date', 'network_load_mw'
-    supply_temps : pd.DataFrame with 'date', 'T_supply'
-    weather : pd.DataFrame with 'date', 'temperature'
-    daily_dispatch : pd.DataFrame with daily production mix
-
-    Returns
-    -------
-    pd.DataFrame with hourly results.
+    scenario_name: str
+    hourly_demand: pd.DataFrame with 'date', 'network_load_mw'
+    supply_temps: pd.Series of hourly 'T_supply'
+    weather: pd.DataFrame with 'date', 'temperature'
+    daily_dispatch: pd.DataFrame with daily DH production mix
     """
     print(f"\n{'='*60}")
     print(f"  Running: {scenario_name}")
     print(f"{'='*60}")
 
-    # ── Merge data ──────────────────────────────────────────────────────────
     df = hourly_demand[["date", "network_load_mw"]].copy()
-    df = df.merge(supply_temps[["date", "T_supply"]], on="date", how="left")
-    df = df.merge(weather[["date", "temperature"]], on="date", how="left")
+
+    supply_temps_df = pd.DataFrame({
+        "date": hourly_demand["date"].sort_values().reset_index(drop=True),
+        "T_supply": supply_temps
+    })
+
+    df = df.merge(supply_temps_df, on="date", how="left")
+    df = df.merge(weather, on="date", how="left")
     df = df.dropna().reset_index(drop=True)
 
-    # Filter for January to March (heating season: months 1 to 3)
+    # Filter for heatings eason (January to March)
     df = df[(df["date"] >= f"{YEAR}-01-01 00:00:00") & (df["date"] <= f"{YEAR}-03-31 23:00:00")].reset_index(drop=True)
 
     original_load_mw = df["network_load_mw"].values.copy()
 
-    # ── Compute scale factor ────────────────────────────────────────────────
+    # Compute scale factor
     scale_info = compute_scale_factor(YEAR)
     scale_factor = scale_info["scale_factor"]
 
-    # Determine TES type
+    # Sizing and initializing the TES based on the scenario name
     if scenario_name == "Water Tank + DSM":
-        tes_type = "Water Tank"
+        tank = WaterTank(water_mass_kg=1000.0, initial_temperature=50.0)
     elif scenario_name == "PCM Storage + DSM":
-        tes_type = "PCM Storage"
+        tank = PCMStorageTank(water_mass_kg=500.0, pcm_mass_kg=578.0, initial_temperature=50.0)
     else:
-        tes_type = "no TES"
+        tank = None
 
-    # Design capacity = 90th percentile of original building demand (kW)
-    design_cap_kw = np.percentile(original_load_mw, 90) * 1000.0 / scale_factor
     substation = Substation(
         secondary_supply_temp=55.0,
         max_primary_flow_kgs=0.5,
-        tes_type=tes_type,
     )
 
     # Sizing Peak Shaving Cap (90% of annual peak demand)
@@ -105,69 +143,152 @@ def run_scenario(
     m_dots_primary = []
     T_water_temps = []
     T_pcm_temps = []
+    Q_primary_kws = []
 
     # Charging and sub-stepping settings
     m_dot_charge_building_nominal = 0.05  # kg/s nominal charging flow
+    n_steps = 60
+    dt_sub = 60.0
+    max_primary_flow_discharging = 0.05
 
-    # ── Hourly physical simulation loop ──────────────────────────────────────
+    # Hourly physical simulation loop
     for idx, row in df.iterrows():
         T_supply = row["T_supply"]
         T_outdoor = row["temperature"]
         hour = row["date"].hour
         network_load_mw = row["network_load_mw"]
 
-        # Building-level heat demand (kW)
+        # Building-level heat demand
         Q_demand_building = (network_load_mw * 1000.0) / scale_factor
 
-        # Determine mode and parameters for substation model
-        mode = "standby"
-        m_dot_charge = 0.0
+        m_dot_sec = 0.2 if Q_demand_building > 0 else 0.0
 
-        if substation.tank is not None:
-            T_water = substation.tank.T_water
-            T_sec_return_est = substation.compute_secondary_return_temperature(Q_demand_building, 55.0)
+        if tank is None:
+            # Baseline
+            T_sec_supply_target = 55.0
+            T_sec_return = compute_secondary_return_temperature(Q_demand_building, T_sec_supply_target, m_dot_sec)
+
+            # Solve for primary flow rate to hit T_sec_supply_target
+            dT_sec = max(0.0, T_sec_supply_target - T_sec_return)
+            delta_T = T_supply - T_sec_return
+            if delta_T > 0 and ETA_HEX > 0:
+                m_dot_needed = (m_dot_sec * dT_sec) / (ETA_HEX * delta_T)
+            else:
+                m_dot_needed = 0.0
+
+            m_dot_primary = min(m_dot_needed, substation.max_primary_flow)
+
+            # Compute HEX
+            r = substation.compute_hex(
+                T_supply_primary=T_supply,
+                m_dot_primary=m_dot_primary,
+                T_sec_return=T_sec_return,
+                T_sec_supply_desired=T_sec_supply_target,
+                out_temp=T_outdoor,
+                eta_HEX=ETA_HEX,
+                m_dot_sec=m_dot_sec,
+            )
+
+            T_return_primary = r["T_return_primary"]
+            T_sec_supply = r["T_sec_supply_HEX"]
+            Q_primary_kw = r["Q_primary_kw"]
+
+            # Recalculate secondary return based on actual supply temperature
+            Q_delivered_kw = ETA_HEX * Q_primary_kw
+            T_sec_return = compute_secondary_return_temperature(Q_delivered_kw, T_sec_supply, m_dot_sec)
+
+            T_water_val = np.nan
+            T_pcm_val = np.nan
+
+        else:
+            # TES scenario
+            T_water_current = tank.T_water
+            T_sec_return_est = compute_secondary_return_temperature(Q_demand_building, 55.0, m_dot_sec=0.2)
 
             is_low_load_hour = network_load_mw < 150.0
             is_charging_hour = hour in [23, 0, 1, 2, 3, 4, 5, 6]
             is_discharging_hour = hour in [7, 8, 9, 17, 18, 19, 20]
 
-            if is_charging_hour and is_low_load_hour and (T_water < 55.0 - 1.0):
-                # Peak prevention: cap the charging flow rate so building load + charging <= Q_cap_building
-                max_charging_power_kw = max(0.0, Q_cap_building_kw - Q_demand_building)
-                m_dot_charge_max = max_charging_power_kw / (CP_WATER * max(0.1, 55.0 - T_water))
-                m_dot_charge = min(m_dot_charge_building_nominal, m_dot_charge_max)
+            mode = "standby"
 
-                if m_dot_charge > 0.001:
-                    mode = "charging"
-                else:
-                    m_dot_charge = 0.0
-                    mode = "standby"
-            elif is_discharging_hour and (T_water > T_sec_return_est + 2.0):
+            if is_charging_hour and is_low_load_hour and (T_water_current < 55.0 - 1.0):
+                # Run pump to charge tank even if building load is low
+                m_dot_sec = 0.2
+                mode = "charging"
+            elif is_discharging_hour and (T_water_current > T_sec_return_est + 2.0):
                 mode = "discharging"
             else:
                 mode = "standby"
 
-        # Run substation (which manages tank state internally if applicable)
-        sub_res = substation.compute_return_temperature(
-            T_supply_primary=T_supply,
-            Q_demand_kw=Q_demand_building,
-            mode=mode,
-            m_dot_charge=m_dot_charge,
-            T_outdoor=T_outdoor,
-        )
+            # Series circuit calculations
+            T_sec_supply = T_water_current
+            T_sec_return = compute_secondary_return_temperature(Q_demand_building, T_sec_supply, m_dot_sec=m_dot_sec)
+            T_sec_inlet = T_sec_return
+
+            # Target temperature selection based on mode
+            if mode == "charging":
+                T_target_HEX = find_required_T_in(tank, m_dot_sec, 55.0, dt_sub, n_steps)
+                T_target_HEX = min(T_target_HEX, 75.0)  # maximum 75 degC
+            else:
+                T_target_HEX = 55.0
+
+            # Calculate primary flow limit
+            if mode == "discharging":
+                limit = max_primary_flow_discharging
+            else:
+                limit = substation.max_primary_flow
+
+            # Solve for primary flow rate to hit T_target_HEX
+            dT_sec = max(0.0, T_target_HEX - T_sec_inlet)
+            delta_T = T_supply - T_sec_inlet
+            if delta_T > 0 and ETA_HEX > 0:
+                m_dot_needed = (m_dot_sec * dT_sec) / (ETA_HEX * delta_T)
+            else:
+                m_dot_needed = 0.0
+
+            m_dot_primary = min(m_dot_needed, limit)
+
+            # Compute HEX
+            r = substation.compute_hex(
+                T_supply_primary=T_supply,
+                m_dot_primary=m_dot_primary,
+                T_sec_return=T_sec_inlet,
+                T_sec_supply_desired=T_target_HEX,
+                out_temp=T_outdoor,
+                eta_HEX=ETA_HEX,
+                m_dot_sec=m_dot_sec,
+            )
+
+            T_return_primary = r["T_return_primary"]
+            T_sec_supply_HEX = r["T_sec_supply_HEX"]
+            Q_primary_kw = r["Q_primary_kw"]
+
+            # Step the tank using HEX outlet temperature
+            T_out_sum = 0.0
+            for _ in range(n_steps):
+                T_out_sub = tank.step(m_dot=m_dot_sec, T_in=T_sec_supply_HEX, dt=dt_sub)
+                T_out_sum += T_out_sub
+            T_out_tank = T_out_sum / n_steps
+
+            # Update final values
+            T_sec_supply = T_out_tank
+            T_sec_return = compute_secondary_return_temperature(Q_demand_building, T_sec_supply, m_dot_sec=m_dot_sec)
+
+            T_water_val = tank.T_water
+            T_pcm_val = tank.pcm.T if hasattr(tank, "pcm") else np.nan
 
         # Scale parameters back to full network level
-        net_charge_building_kw = sub_res["Q_charge_kw"] - sub_res["Q_discharge_kw"]
-        net_charge_network_mw = (net_charge_building_kw * scale_factor) / 1000.0
-        modified_demand_network_mw = network_load_mw + net_charge_network_mw
+        modified_demand_network_mw = (Q_primary_kw * scale_factor) / 1000.0
+        net_charge_network_mw = modified_demand_network_mw - (Q_demand_building * scale_factor / 1000.0)
 
         modified_load_mw.append(max(modified_demand_network_mw, 0.0))
         tes_charge_mw.append(net_charge_network_mw)
-        T_returns.append(sub_res["T_return_primary"])
-        T_sec_returns.append(sub_res["T_secondary_return"])
-        m_dots_primary.append(sub_res["m_dot_primary"] * scale_factor)
-        T_water_temps.append(sub_res["T_water"])
-        T_pcm_temps.append(sub_res["T_pcm"])
+        T_returns.append(T_return_primary)
+        T_sec_returns.append(T_sec_return)
+        m_dots_primary.append(m_dot_primary * scale_factor)
+        T_water_temps.append(T_water_val)
+        T_pcm_temps.append(T_pcm_val)
+        Q_primary_kws.append(Q_primary_kw)
 
     df["modified_load_mw"] = modified_load_mw
     df["tes_charge_mw"] = tes_charge_mw
@@ -176,10 +297,11 @@ def run_scenario(
     df["m_dot_primary"] = m_dots_primary
     df["T_water"] = T_water_temps
     df["T_pcm"] = T_pcm_temps
+    df["Q_primary_kw"] = Q_primary_kws
 
-    # ── Production dispatch ─────────────────────────────────────────────────
-    if substation.tank is not None:
-        # Re-dispatch for modified load profile (DSM/shifting)
+    # Production dispatch
+    if tank is not None:
+        # Re-dispatch for modified load profile
         dispatch = redispatch_for_modified_load(
             daily_dispatch,
             original_load_mw,
@@ -187,7 +309,7 @@ def run_scenario(
             pd.DatetimeIndex(df["date"]),
         )
     else:
-        # Standard proportional dispatch matching baseline demand shape
+        # Proportional dispatch
         dispatch_input = pd.DataFrame({
             "date": df["date"],
             "network_load_mw": df["modified_load_mw"],
@@ -205,7 +327,7 @@ def run_scenario(
         for src in PRIORITY_SOURCES:
             df[src] = 0.0
 
-    # ── CHP efficiency and Flue Gas Condensation ────────────────────────────
+    # CHP efficiency and Flue Gas Condensation
     chp = CHPModel()
     fgc = FlueGasCondensationModel()
 
@@ -216,7 +338,7 @@ def run_scenario(
         eff = chp.compute_efficiency(row["T_return_primary"])
         eta_els.append(eff["eta_el"])
 
-        # FGC recovery based on waste heat hourly output (MWh -> kW)
+        # FGC recovery based on waste heat hourly output
         fgc_kw = fgc.compute_recovery(
             row["T_return_primary"],
             row.get("Waste heat", 0) * 1000.0,
@@ -227,10 +349,11 @@ def run_scenario(
     df["fgc_recovery_mw"] = fgc_recoveries
     df["scenario"] = scenario_name
 
-    # ── Summary KPIs printout ───────────────────────────────────────────────
+    # print KPIs
     print(f"  Hours simulated: {len(df)}")
     print(f"  Demand — original peak: {original_load_mw.max():.1f} MW, "
           f"modified peak: {df['modified_load_mw'].max():.1f} MW")
+
     # Flow-weighted return temperature average
     flow_sum = df["m_dot_primary"].sum()
     if flow_sum > 0:
@@ -249,7 +372,7 @@ def run_scenario(
 def main():
     print("Loading data...")
 
-    # ── Load data ───────────────────────────────────────────────────────────
+    # Load data
     hourly_demand = load_and_scale_building_load(YEAR, diversity_factor=0.85)
     supply_temps = load_supply_temperature(YEAR)
     daily_dispatch = load_daily_dispatch(YEAR)
@@ -264,7 +387,7 @@ def main():
     print(f"Network annual demand: {scale_info['network_annual_mwh']:,.0f} MWh")
     print(f"Peak network load: {hourly_demand['network_load_mw'].max():.1f} MW")
 
-    # ── Scenario 1: Baseline (no TES, no DSM) ──────────────────────────────
+    # Baseline Scenario
     baseline = run_scenario(
         "Baseline (no TES/DSM)",
         hourly_demand,
@@ -273,7 +396,7 @@ def main():
         daily_dispatch,
     )
 
-    # ── Scenario 2: Water Tank + DSM ───────────────────────────────────────
+    # Water Tank scenario
     water_tank_res = run_scenario(
         "Water Tank + DSM",
         hourly_demand,
@@ -282,7 +405,7 @@ def main():
         daily_dispatch,
     )
 
-    # ── Scenario 3: PCM Storage + DSM ──────────────────────────────────────
+    # PCM Storage scenario
     pcm_res = run_scenario(
         "PCM Storage + DSM",
         hourly_demand,
@@ -291,12 +414,12 @@ def main():
         daily_dispatch,
     )
 
-    # ── Save results ────────────────────────────────────────────────────────
+    # Save results
     baseline.to_csv(OUTPUT_DIR / "baseline_results.csv", index=False)
-    water_tank_res.to_csv(OUTPUT_DIR / "tes_results.csv", index=False)
-    pcm_res.to_csv(OUTPUT_DIR / "dsm_results.csv", index=False)
+    water_tank_res.to_csv(OUTPUT_DIR / "water_tank_results.csv", index=False)
+    pcm_res.to_csv(OUTPUT_DIR / "pcm_storage_results.csv", index=False)
 
-    # ── Combined summary ────────────────────────────────────────────────────
+    # Combined summary
     print("\n" + "=" * 70)
     print("  SUMMARY — Scenario Comparison")
     print("=" * 70)
@@ -329,10 +452,9 @@ def main():
     summary = pd.DataFrame(summary_rows)
     summary.to_csv(OUTPUT_DIR / "summary.csv", index=False)
 
-    # Print formatted
     print(summary.to_string(index=False, float_format="{:.4f}".format))
 
-    # ── Compute benefits relative to baseline ───────────────────────────────
+    # Benefits relative to baseline
     print("\n" + "=" * 70)
     print("  BENEFITS vs BASELINE")
     print("=" * 70)
