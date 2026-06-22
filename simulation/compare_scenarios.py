@@ -1,20 +1,3 @@
-"""
-Scenario Comparison & Visualization
-====================================
-Generates publication-quality figures comparing the three scenarios:
-    1. Baseline (no TES/DSM)
-    2. TES only
-    3. TES + DSM
-
-Figures produced:
-    1. Load duration curves (all 3 scenarios overlaid)
-    2. Weekly load profile comparison (winter peak week)
-    3. Return temperature distributions (histogram)
-    4. Monthly production mix (stacked bar, per scenario)
-    5. CHP efficiency time series
-    6. Summary KPI bar charts
-"""
-
 import sys
 import numpy as np
 import pandas as pd
@@ -53,8 +36,8 @@ def load_results():
     scenarios = {}
     for fname, label in [
         ("baseline_results.csv", "Baseline (no TES/DSM)"),
-        ("tes_results.csv", "Water Tank + DSM"),
-        ("dsm_results.csv", "PCM Storage + DSM"),
+        ("water_tank_results.csv", "Water Tank + DSM"),
+        ("pcm_storage_results.csv", "PCM Storage + DSM"),
     ]:
         path = RESULTS_DIR / fname
         if path.exists():

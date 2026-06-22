@@ -1,34 +1,34 @@
 class PCMModel:
     def __init__(self, volume_liters=None, mass_kg=None, initial_temperature=40.0):
-        self.cp_standard = 2000.0     # 2 kJ/kg·K baseline specific heat (J/kg·K)
+        # Specific heat capacity of solid phase (at 15 °C): 2 kJ/kg·K -> 2000 J/kg·K
+        self.cp_standard = 2000.0     
 
-        # Combination of latent and sensible heat (150 kJ/kg ± 7.5%) is measured by
-        # Rubitherm over a 55-70 °C window (not the narrower 58-65 °C melting area),
-        # so the transition window is widened to match the datasheet's basis.
-        self.T_solid = 55.0           # Start of transition window (°C)
-        self.T_liquid = 70.0          # End of transition window (°C)
+        # Actual phase change temperature boundaries from Rubitherm RT55 datasheet
+        self.T_solid = 51.0           # Start of melting area (°C)
+        self.T_liquid = 57.0          # End of melting/congealing area (°C)
         self.dT = self.T_liquid - self.T_solid
 
-        # Combined Latent + Sensible heat capacity inside the 55-70 °C window (J/kg)
-        self.total_transition_energy = 150000.0
+        # Latent heat storage capacity: 170 kJ/kg -> 170,000 J/kg
+        self.latent_heat_energy = 170000.0
 
-        # Effective specific heat during phase change
-        self.cp_phase_change = self.total_transition_energy / self.dT
+        # Effective specific heat during phase change (Latent heat spread over the dT window)
+        # Added to the base sensible heat capacity to get total capacity in the transition zone
+        self.cp_phase_change = self.cp_standard + (self.latent_heat_energy / self.dT)
 
-        # Determine Mass (M_pcm)
-        if mass_kg:
+        # Determine Mass (M_pcm) based on liquid phase density (0.77 kg/l)
+        if mass_kg is not None:
             self.mass = mass_kg
-        elif volume_liters:
-            self.mass = volume_liters * 0.83
+        elif volume_liters is not None:
+            self.mass = volume_liters * 0.77  # 0.77 kg/l density at 80 °C
         else:
-            self.mass = 60.2   # kg
+            self.mass = 60.2   # Default fallback (kg)
 
         # Initial temperature
         self.T = initial_temperature
 
     def get_effective_cp(self, T):
         """Returns effective specific heat capacity (J/kg·K) based on the current
-        temperature"""
+        temperature and the RT55 phase change window"""
         if self.T_solid <= T <= self.T_liquid:
             return self.cp_phase_change
         else:
@@ -44,7 +44,7 @@ class PCMStorageTank:
         self.pcm = PCMModel(mass_kg=pcm_mass_kg, initial_temperature=initial_temperature)
         
         # Heat transfer coefficient * surface area coupling water and PCM tube (W/K)
-        self.UA_pcm = 2000.0      # W/K — realistic for finned/encapsulated PCM in water
+        self.UA_pcm = 2000.0      # W/K
 
         # Ambient loss coefficient (W/K) and ambient temperature
         self.UA_loss = 2.0
@@ -53,19 +53,10 @@ class PCMStorageTank:
     def step(self, m_dot, T_in, dt):
         """
         Advances the state of the tank by one time step.
-        
-        Args:
-            m_dot: Mass flow rate through the storage (kg/s)
-            T_in: Temperature of water entering from heat exchanger (°C)
-            dt: Time step (seconds)
-        
-        Returns:
-            T_out: Temperature of water leaving to the building (= T_water, well mixed)
         """
-        # The temperature of water leaving the tank to the building is the tank temperature (well mixed)
         T_out = self.T_water
 
-        # Current properties
+        # Current temperature-dependent PCM effective heat capacity
         cp_pcm_eff = self.pcm.get_effective_cp(self.pcm.T)
         
         # Heat exchange between tank water and PCM (W)
@@ -80,7 +71,7 @@ class PCMStorageTank:
         # Energy carried out by water leaving to building at tank temperature (W)
         Q_out = m_dot * self.cp_water * self.T_water
 
-        # Total energy balance on the tank water (W)
+        # Total energy balance equations
         dT_water_dt = (Q_in - Q_out - Q_pcm - Q_loss) / (self.M_water * self.cp_water)
         dT_pcm_dt = Q_pcm / (self.pcm.mass * cp_pcm_eff)
 
@@ -104,25 +95,16 @@ class WaterTank:
     def step(self, m_dot, T_in, dt):
         """
         Advances the state of the tank by one time step.
-
-        Args:
-            m_dot: Mass flow rate through the storage (kg/s)
-            T_in: Temperature of water entering from heat exchanger (°C)
-            dt: Time step (seconds)
-        
-        Returns:
-            T_out: Temperature of water leaving to the building (= T_water, well mixed)
         """
-        # The temperature of water leaving the tank to the building is the tank temperature (well mixed)
         T_out = self.T_water
         
         # Heat loss to ambient environment (W)
         Q_loss = self.UA_loss * (self.T_water - self.T_amb)
 
-        # Energy carried in by hot water from heat exchanger (W)
+        # Energy carried in by hot water (W)
         Q_in = m_dot * self.cp_water * T_in
 
-        # Energy carried out by water leaving to building at tank temperature (W)
+        # Energy carried out by water (W)
         Q_out = m_dot * self.cp_water * self.T_water
 
         # Total energy balance on the tank water (W)
@@ -135,12 +117,13 @@ class WaterTank:
 
 
 if __name__ == "__main__":
-    pcm_tank = PCMStorageTank(water_mass_kg=500.0, pcm_mass_kg=578.0, initial_temperature=55.0)
-    water_tank = WaterTank(water_mass_kg=500.0, initial_temperature=55.0)
+    # Test simulation with updated parameters (starting at 50 °C to witness the 51-57 °C phase transition)
+    pcm_tank = PCMStorageTank(water_mass_kg=500.0, pcm_mass_kg=578.0, initial_temperature=50.0)
+    water_tank = WaterTank(water_mass_kg=500.0, initial_temperature=50.0)
 
-    dt = 60.0          # Time step (seconds)
-    hours = 1          # hours simulation
-    total_time = hours * 3600     # seconds simulation
+    dt = 1.0          # Decreased time step to 1 second for numerical stability in explicit Euler
+    hours = 1 
+    total_time = hours * 3600
     time_steps = int(total_time / dt)
 
     m_dot_supply = 0.56    # kg/s
@@ -150,18 +133,10 @@ if __name__ == "__main__":
     print("-" * 72)
 
     for step in range(time_steps):
-        T_out_pcm = pcm_tank.step(
-            m_dot=m_dot_supply,
-            T_in=T_supply,
-            dt=dt
-        )
-        T_out_water = water_tank.step(
-            m_dot=m_dot_supply,
-            T_in=T_supply,
-            dt=dt
-        )
+        T_out_pcm = pcm_tank.step(m_dot=m_dot_supply, T_in=T_supply, dt=dt)
+        T_out_water = water_tank.step(m_dot=m_dot_supply, T_in=T_supply, dt=dt)
 
-        # Print logs every 5 minutes
-        if (step * dt) % 60 == 0:
+        # Print logs every 5 minutes (300 seconds)
+        if (step * dt) % 300 == 0:
             mins = int((step * dt) / 60)
             print(f"{mins:<12}{pcm_tank.T_water:<18.2f}{pcm_tank.pcm.T:<22.2f}{water_tank.T_water:<20.2f}")

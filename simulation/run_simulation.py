@@ -22,8 +22,8 @@ PRIORITY_SOURCES = ["Waste heat", "Electricity", "Biomass", "Fossil fuel"]
 CP_WATER = 4.184    # kJ/(kg·K)
 ETA_HEX = 0.95      # HEX efficiency
 T_APPROACH = 3.0    # Minimum primary-to-secondary return approach temperature (degC)
-T_SEC_SUPPLY = 55.0   # Target secondary supply temperature (degC)
-M_DOT_SEC = 0.25   # Secondary mass flow rate (kg/s)
+T_SEC_SUPPLY = 60.0   # Target secondary supply temperature (degC)
+M_DOT_SEC = 0.20   # Secondary mass flow rate (kg/s)
 T_MIN_TES = 40.0    # Minimum allowable TES temperature (degC); forces charging if breached
 
 
@@ -297,7 +297,7 @@ def run_scenario(
         T_returns.append(T_return_primary)
         T_sec_returns.append(T_sec_return)
         T_sec_HEX_outs.append(T_sec_HEX_out)
-        m_dots_primary.append(m_dot_primary * scale_factor)
+        m_dots_primary.append(m_dot_primary)
         T_water_temps.append(T_water_val)
         T_pcm_temps.append(T_pcm_val)
         Q_primary_kws.append(Q_primary_kw)
