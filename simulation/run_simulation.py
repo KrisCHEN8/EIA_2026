@@ -19,9 +19,12 @@ OUTPUT_DIR = BASE_DIR / "simulation" / "results"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 PRIORITY_SOURCES = ["Waste heat", "Electricity", "Biomass", "Fossil fuel"]
-CP_WATER = 4.184  # kJ/(kg·K)
-ETA_HEX = 0.90     # HEX efficiency
-T_APPROACH = 3.0   # Minimum primary-to-secondary return approach temperature (degC)
+CP_WATER = 4.184    # kJ/(kg·K)
+ETA_HEX = 0.95      # HEX efficiency
+T_APPROACH = 3.0    # Minimum primary-to-secondary return approach temperature (degC)
+T_SEC_SUPPLY = 55.0   # Target secondary supply temperature (degC)
+M_DOT_SEC = 0.25   # Secondary mass flow rate (kg/s)
+T_MIN_TES = 40.0    # Minimum allowable TES temperature (degC); forces charging if breached
 
 
 def compute_secondary_return_temperature(Q_demand_kw, T_sec_supply, m_dot_sec):
@@ -35,7 +38,7 @@ def compute_secondary_return_temperature(Q_demand_kw, T_sec_supply, m_dot_sec):
 def find_required_T_in(tank, m_dot, T_target, dt_sub, n_steps):
     """
     Solve for the tank inlet temperature (T_in) that will result in the
-    final tank water temperature reaching T_target (55.0°C) after n_steps.
+    final tank water temperature reaching T_target after n_steps.
     """
     if m_dot <= 0:
         return T_target
@@ -127,30 +130,26 @@ def run_scenario(
         tank = None
 
     substation = Substation(
-        secondary_supply_temp=55.0,
+        secondary_supply_temp=T_SEC_SUPPLY,
         max_primary_flow_kgs=0.5,
         T_approach=T_APPROACH,
     )
-
-    # Sizing Peak Shaving Cap (90% of annual peak demand)
-    network_peak_mw = original_load_mw.max()
-    Q_cap_building_kw = (network_peak_mw * 0.90 * 1000.0) / scale_factor
 
     # Simulation lists
     modified_load_mw = []
     tes_charge_mw = []
     T_returns = []
     T_sec_returns = []
+    T_sec_HEX_outs = []
     m_dots_primary = []
     T_water_temps = []
     T_pcm_temps = []
     Q_primary_kws = []
 
     # Charging and sub-stepping settings
-    m_dot_charge_building_nominal = 0.05  # kg/s nominal charging flow
     n_steps = 60
     dt_sub = 60.0
-    max_primary_flow_discharging = 0.05
+    max_primary_flow_discharging = 0.01
 
     # Hourly physical simulation loop
     for idx, row in df.iterrows():
@@ -162,11 +161,11 @@ def run_scenario(
         # Building-level heat demand
         Q_demand_building = (network_load_mw * 1000.0) / scale_factor
 
-        m_dot_sec = 0.2 if Q_demand_building > 0 else 0.0
+        m_dot_sec = M_DOT_SEC if Q_demand_building > 0 else 0.0
 
         if tank is None:
             # Baseline
-            T_sec_supply_target = 55.0
+            T_sec_supply_target = T_SEC_SUPPLY
             T_sec_return = compute_secondary_return_temperature(Q_demand_building, T_sec_supply_target, m_dot_sec)
 
             # Solve for primary flow rate to hit T_sec_supply_target.
@@ -202,21 +201,29 @@ def run_scenario(
 
             T_water_val = np.nan
             T_pcm_val = np.nan
+            T_sec_HEX_out = T_sec_supply
 
         else:
             # TES scenario
             T_water_current = tank.T_water
-            T_sec_return_est = compute_secondary_return_temperature(Q_demand_building, 55.0, m_dot_sec=0.2)
+            T_sec_return_est = compute_secondary_return_temperature(Q_demand_building, T_SEC_SUPPLY, m_dot_sec=M_DOT_SEC)
 
             is_low_load_hour = network_load_mw < 150.0
             is_charging_hour = hour in [23, 0, 1, 2, 3, 4, 5, 6]
             is_discharging_hour = hour in [7, 8, 9, 17, 18, 19, 20]
+            is_below_min_temp = T_water_current < T_MIN_TES  # Hard minimum constraint
 
             mode = "standby"
 
-            if is_charging_hour and is_low_load_hour and (T_water_current < 55.0 - 1.0):
-                # Run pump to charge tank even if building load is low
-                m_dot_sec = 0.2
+            if is_below_min_temp:
+                # Emergency charging: TES temperature has fallen below the minimum
+                # allowable threshold (T_MIN_TES = 40 °C). Force charging regardless
+                # of the time-of-day schedule or network load level.
+                m_dot_sec = M_DOT_SEC
+                mode = "charging"
+            elif is_charging_hour and is_low_load_hour and (T_water_current < T_SEC_SUPPLY - 1.0):
+                # Scheduled off-peak charging
+                m_dot_sec = M_DOT_SEC
                 mode = "charging"
             elif is_discharging_hour and (T_water_current > T_sec_return_est + 2.0):
                 mode = "discharging"
@@ -230,10 +237,10 @@ def run_scenario(
 
             # Target temperature selection based on mode
             if mode == "charging":
-                T_target_HEX = find_required_T_in(tank, m_dot_sec, 55.0, dt_sub, n_steps)
+                T_target_HEX = find_required_T_in(tank, m_dot_sec, T_SEC_SUPPLY, dt_sub, n_steps)
                 T_target_HEX = min(T_target_HEX, 75.0)  # maximum 75 degC
             else:
-                T_target_HEX = 55.0
+                T_target_HEX = T_SEC_SUPPLY
 
             # Calculate primary flow limit
             if mode == "discharging":
@@ -241,9 +248,7 @@ def run_scenario(
             else:
                 limit = substation.max_primary_flow
 
-            # Solve for primary flow rate to hit T_target_HEX.
-            # delta_T uses T_sec_inlet + T_APPROACH as the effective cold-side floor,
-            # enforcing the same minimum approach temperature as compute_hex.
+            # Solve for primary flow rate to hit T_target_HEX
             dT_sec = max(0.0, T_target_HEX - T_sec_inlet)
             delta_T = T_supply - (T_sec_inlet + T_APPROACH)
             if delta_T > 0 and ETA_HEX > 0:
@@ -281,6 +286,7 @@ def run_scenario(
 
             T_water_val = tank.T_water
             T_pcm_val = tank.pcm.T if hasattr(tank, "pcm") else np.nan
+            T_sec_HEX_out = T_sec_supply_HEX
 
         # Scale parameters back to full network level
         modified_demand_network_mw = (Q_primary_kw * scale_factor) / 1000.0
@@ -290,6 +296,7 @@ def run_scenario(
         tes_charge_mw.append(net_charge_network_mw)
         T_returns.append(T_return_primary)
         T_sec_returns.append(T_sec_return)
+        T_sec_HEX_outs.append(T_sec_HEX_out)
         m_dots_primary.append(m_dot_primary * scale_factor)
         T_water_temps.append(T_water_val)
         T_pcm_temps.append(T_pcm_val)
@@ -299,6 +306,7 @@ def run_scenario(
     df["tes_charge_mw"] = tes_charge_mw
     df["T_return_primary"] = T_returns
     df["T_secondary_return"] = T_sec_returns
+    df["T_HEX_out"] = T_sec_HEX_outs
     df["m_dot_primary"] = m_dots_primary
     df["T_water"] = T_water_temps
     df["T_pcm"] = T_pcm_temps
@@ -306,7 +314,7 @@ def run_scenario(
 
     # Production dispatch
     if tank is not None:
-        # Re-dispatch for modified load profile
+        # Redispatch for modified load profile
         dispatch = redispatch_for_modified_load(
             daily_dispatch,
             original_load_mw,
