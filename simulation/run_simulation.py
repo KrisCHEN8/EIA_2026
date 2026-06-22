@@ -20,7 +20,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 PRIORITY_SOURCES = ["Waste heat", "Electricity", "Biomass", "Fossil fuel"]
 CP_WATER = 4.184  # kJ/(kg·K)
-ETA_HEX = 0.70     # HEX efficiency
+ETA_HEX = 0.90     # HEX efficiency
+T_APPROACH = 3.0   # Minimum primary-to-secondary return approach temperature (degC)
 
 
 def compute_secondary_return_temperature(Q_demand_kw, T_sec_supply, m_dot_sec):
@@ -77,7 +78,6 @@ def find_required_T_in(tank, m_dot, T_target, dt_sub, n_steps):
     return T_in_opt
 
 
-
 def run_scenario(
     scenario_name: str,
     hourly_demand: pd.DataFrame,
@@ -129,6 +129,7 @@ def run_scenario(
     substation = Substation(
         secondary_supply_temp=55.0,
         max_primary_flow_kgs=0.5,
+        T_approach=T_APPROACH,
     )
 
     # Sizing Peak Shaving Cap (90% of annual peak demand)
@@ -168,9 +169,11 @@ def run_scenario(
             T_sec_supply_target = 55.0
             T_sec_return = compute_secondary_return_temperature(Q_demand_building, T_sec_supply_target, m_dot_sec)
 
-            # Solve for primary flow rate to hit T_sec_supply_target
+            # Solve for primary flow rate to hit T_sec_supply_target.
+            # delta_T uses T_sec_return + T_APPROACH as the effective cold-side floor,
+            # enforcing the same minimum approach temperature as compute_hex.
             dT_sec = max(0.0, T_sec_supply_target - T_sec_return)
-            delta_T = T_supply - T_sec_return
+            delta_T = T_supply - (T_sec_return + T_APPROACH)
             if delta_T > 0 and ETA_HEX > 0:
                 m_dot_needed = (m_dot_sec * dT_sec) / (ETA_HEX * delta_T)
             else:
@@ -238,9 +241,11 @@ def run_scenario(
             else:
                 limit = substation.max_primary_flow
 
-            # Solve for primary flow rate to hit T_target_HEX
+            # Solve for primary flow rate to hit T_target_HEX.
+            # delta_T uses T_sec_inlet + T_APPROACH as the effective cold-side floor,
+            # enforcing the same minimum approach temperature as compute_hex.
             dT_sec = max(0.0, T_target_HEX - T_sec_inlet)
-            delta_T = T_supply - T_sec_inlet
+            delta_T = T_supply - (T_sec_inlet + T_APPROACH)
             if delta_T > 0 and ETA_HEX > 0:
                 m_dot_needed = (m_dot_sec * dT_sec) / (ETA_HEX * delta_T)
             else:

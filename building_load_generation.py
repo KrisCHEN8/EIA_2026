@@ -52,7 +52,6 @@ plt.tight_layout()
 plt.savefig("./figs/heating_curve.png", dpi=300)
 plt.close()
 
-
 # mapping the 2024 temperature
 weather_df = pd.read_csv("./DH production mix/weather.csv")
 weather_df.index = pd.to_datetime(weather_df['date'], format='%Y-%m-%d %H:%M:%S')
@@ -63,3 +62,38 @@ noise = rng.normal(loc=err_mean, scale=err_std, size=len(weather_df))
 weather_df['load'] = (weather_df['load'] + noise).clip(lower=0)
 
 weather_df[['date', 'load']].to_csv('./DH production mix/building_load.csv')
+
+# Plot simulated load against outdoor temperature for January to March 2024
+weather_df_jan_mar = weather_df.loc['2024-01-01 00:00:00':'2024-03-31 23:00:00']
+
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(
+    weather_df_jan_mar.index,
+    weather_df_jan_mar['load'],
+    # alpha=0.25,
+    # s=10,
+    # color="#4C9BE8",
+    label="Hourly simulated load (Jan-Mar 2024)"
+)
+
+# # Plot quadratic fit curve for reference
+# T_min = weather_df_jan_mar['temperature'].min()
+# T_max = weather_df_jan_mar['temperature'].max()
+# T_range_jan_mar = np.linspace(T_min, T_max, 200)
+# ax.plot(
+#     T_range_jan_mar,
+#     poly(T_range_jan_mar),
+#     color="#E84C4C",
+#     linewidth=2.5,
+#     label="Quadratic fit reference"
+# )
+
+plt.yticks(fontsize=14)
+plt.xticks(fontsize=14)
+ax.set_xlabel("Datetime", fontsize=14)
+ax.set_ylabel("Building load (kW)", fontsize=14)
+ax.legend(fontsize=12)
+ax.grid(True, linestyle="--", alpha=0.4)
+plt.tight_layout()
+plt.savefig("./figs/load.png", dpi=300)
+plt.close()

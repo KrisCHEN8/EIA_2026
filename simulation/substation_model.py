@@ -19,14 +19,18 @@ class Substation:
         self,
         secondary_supply_temp = 55.0,
         max_primary_flow_kgs = 0.5,
+        T_approach = 4.0,
         **kwargs,
     ):
         """
         secondary_supply_temp: Design secondary supply temperature (degC). Default is 55.0.
         max_primary_flow_kgs: Maximum primary flow rate (kg/s). Default is 0.5.
+        T_approach: Minimum temperature difference (degC) between primary return and
+            secondary return, representing a realistic finite-size HEX. Default is 4.0.
         """
         self.T_sec_supply_design = secondary_supply_temp
         self.max_primary_flow = max_primary_flow_kgs
+        self.T_approach = T_approach
 
     def compute_hex(
         self,
@@ -45,30 +49,38 @@ class Substation:
         so that the T_to_building (water leaving TES) is close to secondary_supply_temp
 
         m_dot_primary needds to be calculated from DSM to ensure T_sec_supply_desired
-        
+
         eta_HEX is the HEX efficiency
-        
+
         T_sec_return will also be calculated during simulation by T_to_building and load and m_dot_sec
+
+        A minimum approach temperature (self.T_approach) is enforced between the primary
+        return and the secondary return, avoiding the zero-approach-temperature (infinite
+        HEX) idealisation.
         """
         if m_dot_primary <= 0.0 or eta_HEX <= 0.0:
             return {
                 "T_return_primary": T_supply_primary,
                 "T_sec_supply_HEX": T_sec_return,
+                "Q_primary_kw": 0.0,
             }
 
         # Solve for the primary return temperature based on energy balance
         dT_sec = max(0.0, T_sec_supply_desired - T_sec_return)
 
         m_dot_primary = np.clip(m_dot_primary, 0.0, self.max_primary_flow)
-        
+
         T_return_primary = T_supply_primary - (m_dot_sec * dT_sec) / (m_dot_primary * eta_HEX)
-        
-        # Second law constraint: primary return cannot be cooler than secondary return
-        if T_return_primary < T_sec_return:
-            T_return_primary = T_sec_return
+
+        # Approach-temperature constraint: primary return must stay at least T_approach
+        # above the secondary return (replaces the zero-approach / infinite-HEX assumption).
+        T_return_min = T_sec_return + self.T_approach
+        if T_return_primary < T_return_min:
+            T_return_primary = T_return_min
 
         # Calculate actual secondary supply temperature leaving HEX
         Q_primary_kw = m_dot_primary * CP_WATER * (T_supply_primary - T_return_primary)
+        Q_primary_kw = max(Q_primary_kw, 0.0)  # cannot be negative
 
         if m_dot_sec > 0.0:
             T_sec_supply_HEX = T_sec_return + eta_HEX * Q_primary_kw / (m_dot_sec * CP_WATER)
