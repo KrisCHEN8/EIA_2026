@@ -61,9 +61,9 @@ for name, df in [("Water Tank", wt), ("PCM Storage", pcm)]:
 # ---- Charge/discharge diagnostics ----
 for label, df in [("Water Tank", wt), ("PCM Storage", pcm)]:
     df["tes_charge_mw"] = pd.to_numeric(df["tes_charge_mw"], errors="coerce")
-    c  = (df["tes_charge_mw"] > 0.1).sum()
-    d  = (df["tes_charge_mw"] < -0.1).sum()
-    s  = len(df) - c - d
+    c = (df["tes_charge_mw"] > 0.1).sum()
+    d = (df["tes_charge_mw"] < -0.1).sum()
+    s = len(df) - c - d
     ec = df.loc[df["tes_charge_mw"] > 0, "tes_charge_mw"].sum()
     ed = df.loc[df["tes_charge_mw"] < 0, "tes_charge_mw"].sum()
     print(f"\n=== {label} – Charge/Discharge ===")
@@ -79,12 +79,12 @@ for label, df in [("Water Tank", wt), ("PCM Storage", pcm)]:
         print(f"  T_pcm:   {df['T_pcm'].dropna().min():.1f} – {df['T_pcm'].dropna().max():.1f} °C")
 
 # ---- Temperature adequacy ----
-print(f"\n=== Temperature Adequacy (can tank deliver ≥ 50 °C?) ===")
+print(f"\n=== Temperature Adequacy (can tank deliver target supply temperature?) ===")
 for name, df in [("Water Tank", wt), ("PCM Storage", pcm)]:
-    lo50 = (df["T_water"] < 50.0).sum()
-    lo45 = (df["T_water"] < 45.0).sum()
-    lo40 = (df["T_water"] < 40.0).sum()
-    print(f"  {name}:  T_water < 50°C: {lo50}h  |  <45°C: {lo45}h  |  <40°C: {lo40}h")
+    lo_target = (df["T_water"] < df["T_sec_supply_target"]).sum()
+    lo_target_minus_5 = (df["T_water"] < (df["T_sec_supply_target"] - 5.0)).sum()
+    lo_target_minus_10 = (df["T_water"] < (df["T_sec_supply_target"] - 10.0)).sum()
+    print(f"  {name}:  T_water < target: {lo_target}h  |  < target-5°C: {lo_target_minus_5}h  |  < target-10°C: {lo_target_minus_10}h")
 
 # ---- Demand shift per hour ----
 print(f"\n=== Per-hour Demand Shift vs Baseline ===")
@@ -130,15 +130,34 @@ def plot_scenario(ax, df_week, title, show_tank_water=False, show_pcm=False):
         ax.plot(df_week["date"], df_week["T_HEX_out"], color="#e74c3c", label="HEX Outlet (Secondary)", linewidth=1.5)
     else:
         ax.plot(df_week["date"], df_week["T_secondary_supply"], color="#e74c3c", label="Secondary Supply", linewidth=1.5)
+    if "T_sec_supply_target" in df_week.columns:
+        ax.plot(df_week["date"], df_week["T_sec_supply_target"], color="#7f8c8d", linestyle="--", label="Target Supply", linewidth=1.2)
     ax.plot(df_week["date"], df_week["T_secondary_return"], color="#3498db", label="Secondary Return", linewidth=1.5)
     if show_tank_water and "T_water" in df_week.columns:
         ax.plot(df_week["date"], df_week["T_water"], color="#2ecc71", label="Tank Water Temp", linestyle="--", linewidth=1.5)
     if show_pcm and "T_pcm" in df_week.columns:
         ax.plot(df_week["date"], df_week["T_pcm"], color="#9b59b6", label="PCM Temp", linestyle=":", linewidth=1.5)
-    ax.set_title(title, fontsize=12, fontweight="bold")
+    
     ax.set_ylabel("Temperature (°C)")
-    ax.legend(loc="upper right")
     ax.grid(True, linestyle=":", alpha=0.6)
+
+    # Twin axis for flow rates
+    ax2 = ax.twinx()
+    if "m_dot_primary" in df_week.columns:
+        ax2.plot(df_week["date"], df_week["m_dot_primary"], color="#e67e22", label="Primary Flow", linestyle="-.", linewidth=1.2, alpha=0.8)
+    if "m_dot_secondary" in df_week.columns:
+        ax2.plot(df_week["date"], df_week["m_dot_secondary"], color="#9b59b6", label="Secondary Flow", linestyle=":", linewidth=1.2, alpha=0.8)
+    
+    ax2.set_ylabel("Flowrate (kg/s)", color="#e67e22")
+    ax2.tick_params(axis='y', labelcolor="#e67e22")
+    ax2.set_ylim(-0.02, 0.55)
+
+    # Combined legend
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="upper right", fontsize=8)
+    
+    ax.set_title(title, fontsize=12, fontweight="bold")
 
 plot_scenario(axes[0], bl_week, "Baseline (no TES/DSM)")
 plot_scenario(axes[1], wt_week, "Water Tank + DSM", show_tank_water=True)

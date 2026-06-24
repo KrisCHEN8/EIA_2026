@@ -73,7 +73,6 @@ class Substation:
         T_return_primary = T_supply_primary - (m_dot_sec * dT_sec) / (m_dot_primary * eta_HEX)
 
         # Approach-temperature constraint: primary return must stay at least T_approach
-        # above the secondary return (replaces the zero-approach / infinite-HEX assumption).
         T_return_min = T_sec_return + self.T_approach
         if T_return_primary < T_return_min:
             T_return_primary = T_return_min
