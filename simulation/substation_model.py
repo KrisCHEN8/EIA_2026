@@ -72,14 +72,14 @@ class Substation:
 
         T_return_primary = T_supply_primary - (m_dot_sec * dT_sec) / (m_dot_primary * eta_HEX)
 
-        # Approach-temperature constraint: primary return must stay at least T_approach
+        # Approach-temperature constraint: primary return must stay at least T_approach above secondary return
         T_return_min = T_sec_return + self.T_approach
         if T_return_primary < T_return_min:
             T_return_primary = T_return_min
 
         # Calculate actual secondary supply temperature leaving HEX
         Q_primary_kw = m_dot_primary * CP_WATER * (T_supply_primary - T_return_primary)
-        Q_primary_kw = max(Q_primary_kw, 0.0)  # cannot be negative
+        Q_primary_kw = max(Q_primary_kw, 0.0)
 
         if m_dot_sec > 0.0:
             T_sec_supply_HEX = T_sec_return + eta_HEX * Q_primary_kw / (m_dot_sec * CP_WATER)

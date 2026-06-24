@@ -24,11 +24,17 @@ T_APPROACH = 3.0    # Minimum primary-to-secondary return approach temperature (
 T_SEC_SUPPLY = 60.0   # Target secondary supply temperature (degC)
 
 # Variable Flow Constraints
-M_DOT_SEC_MAX = 0.50    # Upper bound pump capacity limit (kg/s)
-M_DOT_SEC_MIN = 0.02    # Lower bound minimum flow limit (kg/s)
+M_DOT_SEC_MAX = 0.30    # Upper bound secondary flow rate (kg/s)
+M_DOT_SEC_MIN = 0.02    # Lower bound secondary flow rate (kg/s)
 DELTA_T_DESIGN = 20.0    # Design temperature difference (degC)
 
-T_MIN_TES = 40.0    # Minimum allowable TES temperature (degC) (design default, will be overridden dynamically)
+M_DOT_PRI_MAX = 0.1    # Upper bound primary flow rate (kg/s)
+M_DOT_PRI_MIN = 0.05    # Lower bound primary flow rate (kg/s)
+
+T_MIN_TES = 45.0    # Minimum TES temperature (degC)
+T_MAX_TES = 65.0    # Maximum TES temperature (degC)
+
+NUM_LAYERS = 3     # Number of layers in the stratified TES model
 
 
 def get_secondary_supply_temp(t_outdoor):
@@ -104,16 +110,26 @@ def find_required_T_in(tank, m_dot, T_target, dt_sub, n_steps):
     if m_dot <= 0:
         return T_target
 
-    T_water_init = tank.T_water
-    T_pcm_init = getattr(tank.pcm, "T", None) if hasattr(tank, "pcm") else None
+    T_water_init = np.copy(tank.T_water) if isinstance(tank.T_water, np.ndarray) else tank.T_water
+    T_pcm_init = None
+    if hasattr(tank, "pcm"):
+        T_pcm_init = np.copy(tank.pcm.T) if isinstance(tank.pcm.T, np.ndarray) else tank.pcm.T
 
     def run_sim(T_in_candidate):
-        tank.T_water = T_water_init
+        if isinstance(tank.T_water, np.ndarray):
+            tank.T_water = T_water_init.copy()
+        else:
+            tank.T_water = T_water_init
+            
         if hasattr(tank, "pcm") and T_pcm_init is not None:
-            tank.pcm.T = T_pcm_init
+            if isinstance(tank.pcm.T, np.ndarray):
+                tank.pcm.T = T_pcm_init.copy()
+            else:
+                tank.pcm.T = T_pcm_init
+                
         for _ in range(n_steps):
             tank.step(m_dot=m_dot, T_in=T_in_candidate, dt=dt_sub)
-        return tank.T_water
+        return tank.mean_temperature
 
     low = 25.0
     high = 150.0
@@ -135,9 +151,16 @@ def find_required_T_in(tank, m_dot, T_target, dt_sub, n_steps):
                 high = mid
         T_in_opt = (low + high) / 2.0
 
-    tank.T_water = T_water_init
+    if isinstance(tank.T_water, np.ndarray):
+        tank.T_water = T_water_init.copy()
+    else:
+        tank.T_water = T_water_init
+        
     if hasattr(tank, "pcm") and T_pcm_init is not None:
-        tank.pcm.T = T_pcm_init
+        if isinstance(tank.pcm.T, np.ndarray):
+            tank.pcm.T = T_pcm_init.copy()
+        else:
+            tank.pcm.T = T_pcm_init
 
     return T_in_opt
 
@@ -172,15 +195,15 @@ def run_scenario(
     scale_factor = scale_info["scale_factor"]
 
     if scenario_name == "Water Tank + DSM":
-        tank = WaterTank(water_mass_kg=1000.0, initial_temperature=50.0)
+        tank = WaterTank(water_mass_kg=1000.0, initial_temperature=50.0, num_layers=NUM_LAYERS)
     elif scenario_name == "PCM Storage + DSM":
-        tank = PCMStorageTank(water_mass_kg=500.0, pcm_mass_kg=578.0, initial_temperature=50.0)
+        tank = PCMStorageTank(water_mass_kg=500.0, pcm_mass_kg=578.0, initial_temperature=50.0, num_layers=NUM_LAYERS)
     else:
         tank = None
 
     substation = Substation(
         secondary_supply_temp=T_SEC_SUPPLY,
-        max_primary_flow_kgs=0.5,
+        max_primary_flow_kgs=M_DOT_PRI_MAX,
         T_approach=T_APPROACH,
     )
 
@@ -195,10 +218,12 @@ def run_scenario(
     Q_primary_kws = []
     T_sec_supply_targets = []
     m_dots_secondary = []
+    T_water_layer_history = []
+    T_pcm_layer_history = []
 
     n_steps = 60
     dt_sub = 60.0
-    max_primary_flow_discharging = 0.01
+    charging_state = True
 
     for idx, row in df.iterrows():
         T_supply = row["T_supply"]
@@ -255,49 +280,28 @@ def run_scenario(
 
         else:
             # TES scenario
-            T_water_current = tank.T_water
-            T_sec_return_est, _ = compute_realistic_secondary_side(Q_demand_building, T_sec_supply_target, m_dot_sec)
+            T_water_top = tank.T_water[-1] if isinstance(tank.T_water, np.ndarray) else tank.T_water
+            T_water_mean = tank.mean_temperature
 
-            is_low_load_hour = network_load_mw < 150.0
-            is_charging_hour = hour in [23, 0, 1, 2, 3, 4, 5, 6]
-            is_discharging_hour = hour in [7, 8, 9, 17, 18, 19, 20]
+            # Hysteretic control based on mean TES temperature
+            if T_water_mean >= T_MAX_TES:
+                charging_state = False
+            elif T_water_mean <= T_MIN_TES:
+                charging_state = True
 
-            # Minimum TES temperature threshold adapts dynamically
-            T_MIN_TES_current = T_sec_supply_target - 5.0
-            is_below_min_temp = T_water_current < T_MIN_TES_current
-
-            if is_below_min_temp:
-                mode = "charging"
-            elif is_charging_hour and is_low_load_hour and (T_water_current < T_sec_supply_target - 1.0):
-                mode = "charging"
-            elif is_discharging_hour and (T_water_current > T_sec_return_est + 2.0):
-                mode = "discharging"
-            else:
-                mode = "standby"
-
-            T_sec_supply = T_water_current
+            T_sec_supply = T_water_top
             T_sec_return, _ = compute_realistic_secondary_side(Q_demand_building, T_sec_supply, m_dot_sec)
             T_sec_inlet = T_sec_return
 
-            if mode == "charging":
-                T_target_HEX = find_required_T_in(tank, m_dot_sec, T_sec_supply_target, dt_sub, n_steps)
-                T_target_HEX = min(T_target_HEX, 75.0)
+            if charging_state:
+                m_dot_primary = M_DOT_PRI_MAX
+                T_target_HEX = 75.0
             else:
+                m_dot_primary = M_DOT_PRI_MIN
                 T_target_HEX = T_sec_supply_target
 
-            if mode == "discharging":
-                limit = max_primary_flow_discharging
-            else:
-                limit = substation.max_primary_flow
-
-            dT_sec = max(0.0, T_target_HEX - T_sec_inlet)
-            delta_T = T_supply - (T_sec_inlet + T_APPROACH)
-            if delta_T > 0 and ETA_HEX > 0:
-                m_dot_needed = (m_dot_sec * dT_sec) / (ETA_HEX * delta_T)
-            else:
-                m_dot_needed = 0.0
-
-            m_dot_primary = min(m_dot_needed, limit)
+            # Clip primary flow to substation's maximum capacity
+            m_dot_primary = min(m_dot_primary, substation.max_primary_flow)
 
             r = substation.compute_hex(
                 T_supply_primary=T_supply,
@@ -322,9 +326,30 @@ def run_scenario(
             T_sec_supply = T_out_tank
             T_sec_return, _ = compute_realistic_secondary_side(Q_demand_building, T_sec_supply, m_dot_sec)
 
-            T_water_val = tank.T_water
-            T_pcm_val = tank.pcm.T if hasattr(tank, "pcm") else np.nan
+            T_water_val = tank.mean_temperature
+            T_pcm_val = np.mean(tank.pcm.T) if hasattr(tank, "pcm") else np.nan
             T_sec_HEX_out = T_sec_supply_HEX
+
+        # Record layer temperatures
+        if tank is None:
+            T_water_layers = np.full(NUM_LAYERS, np.nan)
+            T_pcm_layers = np.full(NUM_LAYERS, np.nan)
+        else:
+            if isinstance(tank.T_water, np.ndarray):
+                T_water_layers = np.copy(tank.T_water)
+            else:
+                T_water_layers = np.full(NUM_LAYERS, tank.T_water)
+            
+            if hasattr(tank, "pcm"):
+                if isinstance(tank.pcm.T, np.ndarray):
+                    T_pcm_layers = np.copy(tank.pcm.T)
+                else:
+                    T_pcm_layers = np.full(NUM_LAYERS, tank.pcm.T)
+            else:
+                T_pcm_layers = np.full(NUM_LAYERS, np.nan)
+
+        T_water_layer_history.append(T_water_layers)
+        T_pcm_layer_history.append(T_pcm_layers)
 
         modified_demand_network_mw = (Q_primary_kw * scale_factor) / 1000.0
         net_charge_network_mw = modified_demand_network_mw - (Q_demand_building * scale_factor / 1000.0)
@@ -351,6 +376,17 @@ def run_scenario(
     df["Q_primary_kw"] = Q_primary_kws
     df["T_sec_supply_target"] = T_sec_supply_targets
     df["m_dot_secondary"] = m_dots_secondary
+
+    # Convert histories to numpy arrays
+    T_water_layer_history = np.array(T_water_layer_history)
+    T_pcm_layer_history = np.array(T_pcm_layer_history)
+
+    # Save layers and mean temperature to dataframe
+    df["T_water_mean"] = T_water_temps
+    df["T_pcm_mean"] = T_pcm_temps
+    for i in range(NUM_LAYERS):
+        df[f"T_water_layer_{i}"] = T_water_layer_history[:, i]
+        df[f"T_pcm_layer_{i}"] = T_pcm_layer_history[:, i]
 
     if tank is not None:
         dispatch = redispatch_for_modified_load(
