@@ -4,10 +4,6 @@ import calendar
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# ==================================================
-# User settings
-# ==================================================
-
 # Use paths relative to this script's directory
 base_dir = Path(__file__).resolve().parent
 
