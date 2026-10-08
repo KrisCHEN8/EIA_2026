@@ -13,7 +13,7 @@ class PlateHEX:
         self.m_p_d = Q_design_kw / (CP * (T_p_in_d - T_p_out_d))
         self.m_s_d = Q_design_kw / (CP * (T_s_out_d - T_s_in_d))
         dT1, dT2 = T_p_in_d - T_s_out_d, T_p_out_d - T_s_in_d
-        self.UA_d = Q_design_kw / ((dT1 - dT2) / np.log(dT1 / dT2))
+        self.UA_d = Q_design_kw / ((dT1 - dT2) / np.log(dT1 / dT2))   # Use LMTD for design value of UA
         self.exp_h = exp_h
 
     def UA(self, m_p, m_s):
@@ -22,7 +22,7 @@ class PlateHEX:
                       + R * (self.m_s_d / m_s) ** self.exp_h)
 
     def solve(self, T_p_in, m_p, T_s_in, m_s):
-        """Both inlets + both flows -> (T_p_out, T_s_out, Q_kw)."""
+        """Both inlets + both flows for T_p_out, T_s_out, Q_kw."""
         if m_p <= 0 or m_s <= 0 or T_p_in <= T_s_in:
             return (T_p_in if m_p > 0 else T_s_in), T_s_in, 0.0
         C_p, C_s = m_p * CP, m_s * CP
@@ -38,7 +38,7 @@ class PlateHEX:
         return T_p_in - Q / C_p, T_s_in + Q / C_s, Q
 
     def control_to_setpoint(self, T_p_in, T_s_in, m_s, T_s_set, m_p_max):
-        """Primary valve: smallest primary flow that brings secondary outlet to setpoint."""
+        """Primary valve: smallest primary flow that satisfy secondary supply teperature"""
         T_p_out, T_s_out, Q = self.solve(T_p_in, m_p_max, T_s_in, m_s)
         if T_s_out <= T_s_set:  # valve fully open, setpoint unreachable
             return dict(m_p=m_p_max, T_p_out=T_p_out, T_s_out=T_s_out, Q=Q, saturated=True)
@@ -55,7 +55,6 @@ class PlateHEX:
 
 class Radiators:
     """Radiator circuit with thermostatic valves: Q = Q_d * (LMTD/LMTD_d)^n."""
-
     def __init__(self, Q_design_kw, T_s_d=60.0, T_r_d=40.0, T_room=21.0, n=1.3, m_max=None):
         self.Q_d, self.T_room, self.n = Q_design_kw, T_room, n
         self.lmtd_d = (T_s_d - T_r_d) / np.log((T_s_d - T_room) / (T_r_d - T_room))
@@ -69,9 +68,8 @@ class Radiators:
         if Q_demand <= 0 or T_supply <= self.T_room + 0.5:
             return T_supply, 0.0, 0.0
         lmtd_req = self.lmtd_d * (Q_demand / self.Q_d) ** (1.0 / self.n)
-        # LMTD falls as T_r falls, so bisect on T_r
         lo, hi = self.T_room + 1e-3, T_supply - 1e-3
-        if self._lmtd(T_supply, hi) < lmtd_req:      # supply too cold: valves fully open
+        if self._lmtd(T_supply, hi) < lmtd_req:
             return self._flow_limited(T_supply)
         for _ in range(40):
             mid = 0.5 * (lo + hi)
@@ -103,12 +101,12 @@ class Substation:
                  loss_fraction=0.01):
         self.hex = PlateHEX(Q_design_kw, **(hex_kwargs or {}))
         self.rad = Radiators(Q_design_kw, **(rad_kwargs or {}))
-        # Valve sized ~30% above design primary flow so peak is reachable at low supply T
+        # Valve sized 30% above design primary flow so peak is reachable at low supply T
         self.m_p_max = m_p_max if m_p_max else 1.3 * self.hex.m_p_d
         self.loss_fraction = loss_fraction
 
     def step_direct(self, T_p_in, T_s_set, Q_demand, n_iter=5):
-        """Baseline: HEX feeds radiators directly. Iterates HEX <-> radiator coupling."""
+        """Baseline: without TES. Iterates HEX and radiator coupling."""
         T_s = min(T_s_set, T_p_in - 0.5)
         res = None
         for _ in range(n_iter):
