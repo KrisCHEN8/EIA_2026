@@ -1,7 +1,3 @@
-"""
-Re-dispatches the daily production mix to hourly resolution.
-"""
-
 import numpy as np
 import pandas as pd
 from pathlib import Path
