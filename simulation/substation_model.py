@@ -97,38 +97,134 @@ class Radiators:
 
 
 class Substation:
-    def __init__(self, Q_design_kw, m_p_max=None, hex_kwargs=None, rad_kwargs=None,
-                 loss_fraction=0.01):
-        self.hex = PlateHEX(Q_design_kw, **(hex_kwargs or {}))
+    """
+    Substation with optional parallel buffer tank (three modes).
+ 
+        DH supply -> HEX -> (a) bypass -> mixing valve -> radiators
+                         -> (b) tank top            (charge)
+        tank top  -> mixing valve -> radiators          (discharge)
+        radiator return -> HEX and/or tank bottom
+ 
+    The tank model itself is NOT here: every step only needs the tank's top/bottom
+    temperature as input and returns the flow + inlet temperature for the tank.
+    Use the SAME Substation object (same HEX size) for baseline and TES runs.
+    """
+ 
+    def __init__(self, Q_design_kw, Q_hex_design_kw=None, m_p_max=None,
+                 hex_kwargs=None, rad_kwargs=None, loss_fraction=0.01, dT_min_charge=3.0):
+        # Radiators are sized for the building; the HEX may be sized larger for charging
         self.rad = Radiators(Q_design_kw, **(rad_kwargs or {}))
-        # Valve sized 30% above design primary flow so peak is reachable at low supply T
+        self.hex = PlateHEX(Q_hex_design_kw or Q_design_kw, **(hex_kwargs or {}))
         self.m_p_max = m_p_max if m_p_max else 1.3 * self.hex.m_p_d
         self.loss_fraction = loss_fraction
-
-    def step_direct(self, T_p_in, T_s_set, Q_demand, n_iter=5):
-        """Baseline: without TES. Iterates HEX and radiator coupling."""
+        self.dT_min_charge = dT_min_charge   # HEX outlet can't be closer than this to T_p_in
+ 
+    # helpers
+    def _q_primary(self, Q_hex):
+        return Q_hex / (1.0 - self.loss_fraction)
+ 
+    def _radiators(self, T_hot, T_set, Q_demand):
+        """Radiators behind a mixing valve fed by a hot source at T_hot.
+        Returns T_r, m_rad, Q_delivered, m_hot (flow drawn from the hot source)."""
+        T_supply = min(T_set, T_hot)
+        T_r, m_rad, Q_del = self.rad.operate(T_supply, Q_demand)
+        if m_rad <= 0:
+            return T_r, 0.0, 0.0, 0.0
+        if T_hot <= T_r + 1e-6:
+            return T_r, m_rad, Q_del, m_rad
+        m_hot = m_rad * (T_supply - T_r) / (T_hot - T_r)
+        return T_r, m_rad, Q_del, m_hot
+ 
+    @staticmethod
+    def _out(mode, hexres, Q_primary, rad, tank):
+        T_r, m_rad, Q_del, T_s = rad
+        return dict(mode=mode, m_p=hexres["m_p"], T_p_out=hexres["T_p_out"], Q_primary=Q_primary,
+                    T_s_supply=T_s, T_s_return=T_r, m_s=m_rad, Q_delivered=Q_del,
+                    saturated=hexres.get("saturated", False), **tank)
+ 
+    # baseline: no tank
+    def step_direct(self, T_p_in, T_s_set, Q_demand, n_iter=60):
+        """HEX feeds radiators directly. Tank (if any) isolated."""
         T_s = min(T_s_set, T_p_in - 0.5)
-        res = None
+        no_tank = dict(m_tank=0.0, T_tank_in=np.nan, Q_tank=0.0)
         for _ in range(n_iter):
             T_r, m_s, Q_del = self.rad.operate(T_s, Q_demand)
             if m_s <= 0:
-                return dict(T_p_out=T_p_in, m_p=0.0, Q_primary=0.0, T_s_supply=T_s,
-                            T_s_return=T_r, m_s=0.0, Q_delivered=0.0, saturated=False)
+                return self._out("direct", dict(m_p=0.0, T_p_out=T_p_in), 0.0,
+                                 (T_r, 0.0, 0.0, T_s), no_tank)
             res = self.hex.control_to_setpoint(T_p_in, T_r, m_s, T_s_set, self.m_p_max)
             if abs(res["T_s_out"] - T_s) < 0.01:
                 break
+            T_s = 0.5 * (T_s + res["T_s_out"])     # damped: only iterates when saturated
+        if res["saturated"]:
+            # Rebuild the secondary side from the HEX solution so energy balances exactly
             T_s = res["T_s_out"]
-        return dict(T_p_out=res["T_p_out"], m_p=res["m_p"],
-                    Q_primary=res["Q"] / (1.0 - self.loss_fraction),
-                    T_s_supply=res["T_s_out"], T_s_return=T_r, m_s=m_s,
-                    Q_delivered=Q_del, saturated=res["saturated"])
-
-    def step_charge(self, T_p_in, T_tank_bottom, m_charge, T_charge_set):
-        """TES charging loop: independent charging pump flow through HEX."""
-        res = self.hex.control_to_setpoint(T_p_in, T_tank_bottom, m_charge,
-                                           T_charge_set, self.m_p_max)
-        res["Q_primary"] = res["Q"] / (1.0 - self.loss_fraction)
-        return res
+            Q_del = res["Q"]
+            T_r = T_s - Q_del / (CP * m_s)
+        return self._out("direct", res, self._q_primary(res["Q"]),
+                         (T_r, m_s, Q_del, res["T_s_out"]), no_tank)
+ 
+    # charge
+    def step_charge(self, T_p_in, T_s_set, Q_demand, T_tank_bottom, Q_charge_target,
+                    T_charge_set, T_bottom_cutoff=None):
+        """HEX heats radiators (via mixing valve) AND charges the tank top.
+        The charging pump is throttled so the water entering the tank top stays at
+        T_charge_set; if HEX/valve capacity runs out, charging power is reduced
+        (heating demand always has priority)."""
+        T_charge_set = min(T_charge_set, T_p_in - self.dT_min_charge)
+        if (T_bottom_cutoff is not None and T_tank_bottom >= T_bottom_cutoff) \
+                or T_charge_set <= T_tank_bottom + 1.0 or Q_charge_target <= 0:
+            return self.step_direct(T_p_in, T_s_set, Q_demand)   # tank full / can't charge
+ 
+        T_r, m_rad, Q_del, m_hot = self._radiators(T_charge_set, T_s_set, Q_demand)
+ 
+        def run(m_ch):
+            m_s = m_hot + m_ch
+            T_s_in = (m_hot * T_r + m_ch * T_tank_bottom) / m_s
+            return self.hex.control_to_setpoint(T_p_in, T_s_in, m_s, T_charge_set, self.m_p_max)
+ 
+        m_ch_max = Q_charge_target / (CP * (T_charge_set - T_tank_bottom))
+        res = run(m_ch_max)
+        m_ch = m_ch_max
+        if res["saturated"]:                 # not enough capacity: throttle charging pump
+            lo, hi = 0.0, m_ch_max
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                if run(mid)["saturated"]:
+                    hi = mid
+                else:
+                    lo = mid
+            m_ch = lo
+            if m_ch < 1e-4:
+                return self.step_direct(T_p_in, T_s_set, Q_demand)
+            res = run(m_ch)
+        Q_tank = m_ch * CP * (res["T_s_out"] - T_tank_bottom)
+        tank = dict(m_tank=m_ch, T_tank_in=res["T_s_out"], Q_tank=Q_tank)   # in at TOP
+        return self._out("charge", res, self._q_primary(res["Q"]),
+                         (T_r, m_rad, Q_del, min(T_s_set, res["T_s_out"])), tank)
+ 
+    # discharge
+    def step_discharge(self, T_p_in, T_s_set, Q_demand, T_tank_top, Q_discharge_target,
+                       T_top_cutoff=None):
+        """Tank covers up to Q_discharge_target via the mixing valve; HEX covers the rest
+        at the normal setpoint. Radiator return is split between tank bottom and HEX."""
+        T_top_cutoff = T_s_set + 1.0 if T_top_cutoff is None else T_top_cutoff
+        if T_tank_top < T_top_cutoff or Q_discharge_target <= 0 or Q_demand <= 0:
+            return self.step_direct(T_p_in, T_s_set, Q_demand)   # tank empty
+ 
+        T_r, m_rad, Q_del = self.rad.operate(T_s_set, Q_demand)
+        Q_from_tank = min(Q_discharge_target, Q_del)
+        m_tank = Q_from_tank / (CP * (T_tank_top - T_r))
+        tank = dict(m_tank=-m_tank, T_tank_in=T_r, Q_tank=-Q_from_tank)   # in at BOTTOM
+ 
+        Q_hex_needed = Q_del - Q_from_tank
+        if Q_hex_needed <= 1e-6:
+            res = dict(m_p=0.0, T_p_out=T_p_in, Q=0.0, saturated=False)
+        else:
+            m_hex_s = Q_hex_needed / (CP * (T_s_set - T_r))
+            res = self.hex.control_to_setpoint(T_p_in, T_r, m_hex_s, T_s_set, self.m_p_max)
+        return self._out("discharge", res, self._q_primary(res["Q"]),
+                         (T_r, m_rad, Q_del, T_s_set), tank)
 
 
 def load_supply_temperature(year=2024):
