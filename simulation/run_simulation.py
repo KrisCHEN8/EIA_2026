@@ -27,15 +27,34 @@ END = f"{YEAR}-04-30 23:00:00"
 
 PRIORITY_SOURCES = ["Waste heat", "Electricity", "Biomass", "Fossil fuel"]
 
+# Radiator circuit (secondary side)
+RAD_SUPPLY_DESIGN = 70.0    # radiator design supply (degC), 70/50 system
+RAD_RETURN_DESIGN = 50.0    # radiator design return (degC)
+CURVE_T_OUT_DESIGN = -20.0  # heating curve: outdoor design temperature (degC)
+CURVE_T_OUT_SUMMER = 15.0   # heating curve: outdoor temperature where the curve reaches its minimum
+CURVE_T_SUPPLY_MIN = 40.0   # heating curve: minimum secondary supply (degC)
+
 # Substation sizing (shared by all scenarios)
 RAD_OVERSIZE = 1.1          # radiator design load = 1.1 x peak building demand
 HEX_OVERSIZE = 1.5          # HEX design load = 1.5 x peak (headroom for charging)
+HEX_T_PRIMARY_IN_DESIGN = 90.0
+HEX_APPROACH_DESIGN = 5.0   # design primary return = radiator design return + 5 K
 LOSS_FRACTION = 0.0         # network data already include losses -> baseline matches data
+
+# Network return-temperature calibration
+# The substation model is fault-free; real networks have bypasses, faulty substations and
+# badly balanced radiator circuits that send warm water to the return. This is represented by
+# a constant bypass flow per building at primary supply temperature (no heat delivered),
+# calibrated so the BASELINE network return equals T_RETURN_TARGET. The same bypass is used
+# in every scenario. Set T_RETURN_TARGET = None for the fault-free case.
+T_RETURN_TARGET = 42.0      # degC, typical Nordic DH return; replace with measured Trondheim value
 
 # Tank
 T_LOW = 40.0                # empty tank / reference temperature (degC)
-T_CHARGE = 65.0             # charging setpoint at tank top (degC)
-T_BOTTOM_CUTOFF = 45.0      # stop charging when tank bottom reaches this (degC)
+T_CHARGE = 75.0             # charging setpoint at tank top (degC); must exceed the cold-weather
+                            # radiator setpoint (up to 70 degC) or the tank cannot discharge at peaks
+T_BOTTOM_CUTOFF = 55.0      # stop charging when tank bottom reaches this (degC); must be above the
+                            # cold-weather radiator return (~45-50 degC with 70/50) or charging stalls
 NUM_LAYERS = 10
 TANK_UA_LOSS = 2.0          # W/K
 PCM_VOLUME_FRACTION = 0.5   # PCM tank: same outer volume, half filled with PCM containers
@@ -49,25 +68,21 @@ N_SUB = 6                   # substation/tank coupling steps per hour
 CHARGE_MAX_RANK = 1         # production-aware: charge when marginal source is waste heat (0) or electricity (1)
 DISCHARGE_MIN_RANK = 2      # production-aware: discharge when marginal source is biomass (2) or fossil (3)
 
-# Scenario matrix
+# Scenario matrix (every building in the network gets the same TES and control)
 STORAGE_TYPES = ["water", "pcm"]
 STRATEGIES = ["peak_shaving", "production_aware"]
 TANK_SIZES_H = [2, 6]       # tank size in hours of mean building demand (water capacity T_LOW..T_CHARGE)
-PENETRATIONS = [0.10, 0.25, 0.50]
 
 
 # ---------------------------------------------------------------------------
 #  Inputs
 # ---------------------------------------------------------------------------
 def heating_curve_secondary(t_outdoor):
-    """Outdoor compensation curve for the radiator circuit (secondary supply setpoint)."""
-    if t_outdoor <= -10.0:
-        return 60.0
-    elif t_outdoor <= 0.0:
-        return 56.0
-    elif t_outdoor <= 5.0:
-        return 52.0
-    return 40.0
+    """Continuous outdoor compensation curve for the radiator circuit: RAD_SUPPLY_DESIGN at
+    CURVE_T_OUT_DESIGN, falling linearly to CURVE_T_SUPPLY_MIN at CURVE_T_OUT_SUMMER."""
+    frac = (CURVE_T_OUT_SUMMER - t_outdoor) / (CURVE_T_OUT_SUMMER - CURVE_T_OUT_DESIGN)
+    T = CURVE_T_SUPPLY_MIN + (RAD_SUPPLY_DESIGN - CURVE_T_SUPPLY_MIN) * frac
+    return float(np.clip(T, CURVE_T_SUPPLY_MIN, RAD_SUPPLY_DESIGN))
 
 
 def load_inputs():
@@ -92,8 +107,13 @@ def load_inputs():
 #  Building level
 # ---------------------------------------------------------------------------
 def make_substation(peak_kw):
+    hex_kwargs = dict(T_p_in_d=HEX_T_PRIMARY_IN_DESIGN,
+                      T_p_out_d=RAD_RETURN_DESIGN + HEX_APPROACH_DESIGN,
+                      T_s_in_d=RAD_RETURN_DESIGN, T_s_out_d=RAD_SUPPLY_DESIGN)
+    rad_kwargs = dict(T_s_d=RAD_SUPPLY_DESIGN, T_r_d=RAD_RETURN_DESIGN)
     return Substation(Q_design_kw=RAD_OVERSIZE * peak_kw,
                       Q_hex_design_kw=HEX_OVERSIZE * peak_kw,
+                      hex_kwargs=hex_kwargs, rad_kwargs=rad_kwargs,
                       loss_fraction=LOSS_FRACTION)
 
 
@@ -131,6 +151,8 @@ def simulate_building(inputs, substation, tank=None, modes=None, Q_charge_kw=0.0
     out = pd.DataFrame(rows)
     out.insert(0, "date", inputs["date"].values)
     out["Q_demand_kw"] = inputs["building_demand_kw"].values
+    out["T_s_set"] = inputs["T_s_set"].values
+    out["T_supply"] = inputs["T_supply"].values
     out["scale_factor"] = inputs["scale_factor"].values
     return out
 
@@ -148,28 +170,58 @@ def tank_energy_report(tank):
 # ---------------------------------------------------------------------------
 #  Network level
 # ---------------------------------------------------------------------------
-def aggregate_network(base, tes, p):
-    """Mix (1-p) baseline buildings and p TES buildings, scaled to the network."""
-    sf = base["scale_factor"].values
-    net = pd.DataFrame({"date": base["date"].values})
-    if tes is None or p == 0:
-        q = base["Q_primary_kw"].values
-        m_b, T_b = base["m_p_mean"].values, base["T_p_out"].values
-        m_t, T_t = np.zeros_like(m_b), np.zeros_like(m_b)
-        q_tank = np.zeros_like(q)
-    else:
-        q = (1 - p) * base["Q_primary_kw"].values + p * tes["Q_primary_kw"].values
-        m_b, T_b = (1 - p) * base["m_p_mean"].values, base["T_p_out"].values
-        m_t, T_t = p * tes["m_p_mean"].values, tes["T_p_out"].values
-        q_tank = p * tes["Q_tank_kw"].values
-    T_b = np.nan_to_num(T_b)
-    T_t = np.nan_to_num(T_t)
-    m = m_b + m_t
-    net["network_load_mw"] = q * sf / 1000.0
-    net["tes_charge_mw"] = q_tank * sf / 1000.0
-    net["m_flow_network_kgs"] = m * sf
+def network_return(bld, m_bypass):
+    """Return temperature of substation flow mixed with the bypass flow (per building, kg/s)."""
+    m_p = bld["m_p_mean"].values
+    T_p = np.nan_to_num(bld["T_p_out"].values)
+    T_sup = bld["T_supply"].values
+    m = m_p + m_bypass
     with np.errstate(invalid="ignore", divide="ignore"):
-        net["T_return_network"] = np.where(m > 0, (m_b * T_b + m_t * T_t) / m, np.nan)
+        T = np.where(m > 0, (m_p * T_p + m_bypass * T_sup) / m, np.nan)
+    return T, m
+
+
+def flow_weighted(T, m):
+    T, m = np.asarray(T, float), np.asarray(m, float)
+    ok = np.isfinite(T) & (m > 0)
+    return float((T[ok] * m[ok]).sum() / m[ok].sum()) if ok.any() else np.nan
+
+
+def network_mean_return(bld, m_bypass):
+    """Flow-weighted network return over the period (flows scaled with the daily factor)."""
+    T, m = network_return(bld, m_bypass)
+    return flow_weighted(T, m * bld["scale_factor"].values)
+
+
+def calibrate_bypass(base_bld, target):
+    """Constant bypass flow per building (kg/s) so the baseline network return equals target."""
+    if target is None:
+        return 0.0
+    T0 = network_mean_return(base_bld, 0.0)
+    if T0 >= target:
+        print(f"  Fault-free return {T0:.1f} degC already >= target, no bypass")
+        return 0.0
+    lo, hi = 0.0, 1.0
+    while network_mean_return(base_bld, hi) < target:
+        hi *= 2.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if network_mean_return(base_bld, mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def aggregate_network(bld, m_bypass):
+    """Scale one building (every building identical) to the network with the daily scale factor."""
+    sf = bld["scale_factor"].values
+    T_ret, m = network_return(bld, m_bypass)
+    net = pd.DataFrame({"date": bld["date"].values})
+    net["network_load_mw"] = bld["Q_primary_kw"].values * sf / 1000.0
+    net["tes_charge_mw"] = bld["Q_tank_kw"].values * sf / 1000.0
+    net["m_flow_network_kgs"] = m * sf
+    net["T_return_network"] = T_ret
     return net
 
 
@@ -185,30 +237,31 @@ def add_dispatch_and_chp(net, baseline_load_mw, daily_dispatch, chp, fgc, is_bas
         net[src] = disp[src].fillna(0.0).values
 
     T_ret = net["T_return_network"].ffill().bfill().values
-    net["eta_el_chp"] = [chp.compute_efficiency(t)["eta_el"] for t in T_ret]
-    net["eta_th_chp"] = [chp.compute_efficiency(t)["eta_th"] for t in T_ret]
+    eff = [chp.compute_efficiency(t) for t in T_ret]
+    net["eta_el_chp"] = [e["eta_el"] for e in eff]
+    net["eta_th_chp"] = [e["eta_th"] for e in eff]
     net["fgc_recovery_mw"] = [fgc.compute_recovery(t, w * 1000.0) / 1000.0
                               for t, w in zip(T_ret, net["Waste heat"].values)]
     return net
 
 
-def flow_weighted(T, m):
-    T, m = np.asarray(T, float), np.asarray(m, float)
-    ok = np.isfinite(T) & (m > 0)
-    return float((T[ok] * m[ok]).sum() / m[ok].sum()) if ok.any() else np.nan
+def top_hours(base_net, share=0.01):
+    """Indices of the highest-load baseline hours (default top 1%)."""
+    n = max(1, int(round(share * len(base_net))))
+    return np.argsort(base_net["network_load_mw"].values)[-n:]
 
 
-def summarize(tag, cfg, net, base_net, bld, base_bld, p, tank_rep, p90_threshold):
-    """One summary row. Building-level quantities are scaled to network level where marked."""
+def summarize(tag, cfg, net, base_net, bld, base_bld, tank_rep, p90_threshold):
     sf = bld["scale_factor"].values
     load = net["network_load_mw"]
-    row = dict(tag=tag, **cfg, penetration=p)
+    row = dict(tag=tag, **cfg)
     row.update({
         "Peak demand (MW)": load.max(),
         "Mean demand (MW)": load.mean(),
         "Heat supplied (GWh)": load.sum() / 1000.0,
         "Load factor": load.mean() / load.max(),
         "Hours above baseline P90": int((load > p90_threshold).sum()),
+        "Load in baseline top-1% hours (MW)": float(load.values[top_hours(base_net)].mean()),
         "T_return network (degC)": flow_weighted(net["T_return_network"], net["m_flow_network_kgs"]),
         "Mean eta_el CHP": net["eta_el_chp"].mean(),
         "FGC recovery (GWh)": net["fgc_recovery_mw"].sum() / 1000.0,
@@ -220,23 +273,24 @@ def summarize(tag, cfg, net, base_net, bld, base_bld, p, tank_rep, p90_threshold
     fuel = base_net["Waste heat"].values / base_net["eta_th_chp"].values
     row["Extra CHP electricity (MWh)"] = float(np.sum(fuel * (net["eta_el_chp"].values - base_net["eta_el_chp"].values)))
 
-    # Per-mode return temperature of TES buildings (building level)
+    # Per-mode primary return of the substation itself (before mixing with the bypass)
     for mode in ["charge", "discharge", "direct"]:
         mask = (bld["mode_scheduled"] == mode).values
-        row[f"T_p_out TES bldg, {mode} hours (degC)"] = flow_weighted(bld["T_p_out"][mask], bld["m_p_mean"][mask]) if mask.any() else np.nan
+        row[f"T_p_out substation, {mode} hours (degC)"] = (
+            flow_weighted(bld["T_p_out"][mask], bld["m_p_mean"][mask]) if mask.any() else np.nan)
+        row[f"T_p_out baseline, same {mode} hours (degC)"] = (
+            flow_weighted(base_bld["T_p_out"][mask], base_bld["m_p_mean"][mask]) if mask.any() else np.nan)
 
-    # Storage operation, scaled to the network share p
     charged = bld["Q_tank_kw"].clip(lower=0) * sf
     discharged = (-bld["Q_tank_kw"]).clip(lower=0) * sf
-    row["Energy charged (MWh)"] = p * charged.sum() / 1000.0
-    row["Energy discharged (MWh)"] = p * discharged.sum() / 1000.0
-    row["Tank dE end-start (MWh)"] = p * tank_rep["tank_dE_kwh"] * float(np.mean(sf)) / 1000.0
-    row["Tank losses (MWh)"] = p * tank_rep["tank_loss_kwh"] * float(np.mean(sf)) / 1000.0
+    row["Energy charged (MWh)"] = charged.sum() / 1000.0
+    row["Energy discharged (MWh)"] = discharged.sum() / 1000.0
+    row["Tank dE end-start (MWh)"] = tank_rep["tank_dE_kwh"] * float(np.mean(sf)) / 1000.0
+    row["Tank losses (MWh)"] = tank_rep["tank_loss_kwh"] * float(np.mean(sf)) / 1000.0
     row["Tank residual (kWh, 1 bldg)"] = tank_rep["tank_residual_kwh"]
     row["Coupling error (kWh, 1 bldg)"] = float((bld["Q_tank_kw"] - bld["Q_tank_substation_kw"]).sum())
-    row["Unmet demand (MWh)"] = float(((1 - p) * base_bld["unmet_kwh"] + p * bld["unmet_kwh"]).mul(sf).sum() / 1000.0)
-    row["Saturated hours (TES bldg)"] = float(bld["frac_saturated"].sum())
-    # Heat supplied corrected for energy left in the tanks at the end
+    row["Unmet demand (MWh)"] = float((bld["unmet_kwh"] * sf).sum() / 1000.0)
+    row["Saturated hours"] = float(bld["frac_saturated"].sum())
     row["Heat supplied, dE-corrected (GWh)"] = row["Heat supplied (GWh)"] - row["Tank dE end-start (MWh)"] / 1000.0
     return row
 
@@ -260,15 +314,21 @@ def main():
     # ---- Baseline -------------------------------------------------------
     print("\nBaseline building...")
     base_bld = simulate_building(inputs, substation)
+    m_bypass = calibrate_bypass(base_bld, T_RETURN_TARGET)
+    T_free = network_mean_return(base_bld, 0.0)
+    print(f"  Fault-free return {T_free:.1f} degC; bypass {m_bypass * 3600:.1f} kg/h per building "
+          f"({m_bypass / substation.hex.m_p_d:.1%} of design primary flow) -> target {T_RETURN_TARGET} degC")
+    base_bld["m_bypass"] = m_bypass
     base_bld.to_csv(OUTPUT_DIR / "building_baseline.csv", index=False)
-    base_net = add_dispatch_and_chp(aggregate_network(base_bld, None, 0.0), None,
+    base_net = add_dispatch_and_chp(aggregate_network(base_bld, m_bypass), None,
                                     daily_dispatch, chp, fgc, is_baseline=True)
     base_net.to_csv(OUTPUT_DIR / "network_baseline.csv", index=False)
     baseline_load = base_net["network_load_mw"].values
     p90 = np.percentile(baseline_load, 90)
 
-    summary = [summarize("baseline", dict(storage="none", strategy="none", size_h=0, volume_l=0.0),
-                         base_net, base_net, base_bld, base_bld, 0.0, tank_energy_report(None), p90)]
+    base_cfg = dict(storage="none", strategy="none", size_h=0, volume_l=0.0,
+                    T_return_fault_free=T_free, m_bypass_kgs=m_bypass)
+    summary = [summarize("baseline", base_cfg, base_net, base_net, base_bld, base_bld, tank_energy_report(None), p90)]
 
     # ---- TES scenarios --------------------------------------------------
     for storage in STORAGE_TYPES:
@@ -283,28 +343,30 @@ def main():
                 tag = f"{storage}_{strategy}_{size_h}h"
                 tank, volume_l = make_tank(storage, size_h, mean_kw)
                 cap_kwh = tank.capacity_kwh(T_LOW, T_CHARGE)
-                print(f"\n{tag}: {volume_l:,.0f} L, capacity {cap_kwh:.1f} kWh")
+                t1 = time.time()
                 bld = simulate_building(inputs, substation, tank, modes,
                                         Q_charge_kw=cap_kwh / N_CHARGE_HOURS,
                                         Q_discharge_kw=cap_kwh / N_DISCHARGE_HOURS)
                 bld["storage"], bld["strategy"], bld["size_h"] = storage, strategy, size_h
+                bld["m_bypass"] = m_bypass
                 bld.to_csv(OUTPUT_DIR / f"building_{tag}.csv", index=False)
                 rep = tank_energy_report(tank)
-                print(f"  tank dE {rep['tank_dE_kwh']:.2f} kWh, losses {rep['tank_loss_kwh']:.1f} kWh, "
-                      f"residual {rep['tank_residual_kwh']:.2e} kWh")
+                print(f"{tag}: {volume_l:,.0f} L, {cap_kwh:.1f} kWh | tank dE {rep['tank_dE_kwh']:.2f} kWh, "
+                      f"losses {rep['tank_loss_kwh']:.1f} kWh, residual {rep['tank_residual_kwh']:.1e} kWh "
+                      f"({time.time() - t1:.0f} s)")
 
-                cfg = dict(storage=storage, strategy=strategy, size_h=size_h, volume_l=volume_l)
-                for p in PENETRATIONS:
-                    net = aggregate_network(base_bld, bld, p)
-                    net = add_dispatch_and_chp(net, baseline_load, daily_dispatch, chp, fgc, is_baseline=False)
-                    net.to_csv(OUTPUT_DIR / f"network_{tag}_p{int(round(p * 100))}.csv", index=False)
-                    summary.append(summarize(tag, cfg, net, base_net, bld, base_bld, p, rep, p90))
+                net = add_dispatch_and_chp(aggregate_network(bld, m_bypass), baseline_load,
+                                           daily_dispatch, chp, fgc, is_baseline=False)
+                net.to_csv(OUTPUT_DIR / f"network_{tag}.csv", index=False)
+                cfg = dict(storage=storage, strategy=strategy, size_h=size_h, volume_l=volume_l,
+                           T_return_fault_free=T_free, m_bypass_kgs=m_bypass)
+                summary.append(summarize(tag, cfg, net, base_net, bld, base_bld, rep, p90))
 
     summary = pd.DataFrame(summary)
     summary.to_csv(OUTPUT_DIR / "summary.csv", index=False)
 
     base = summary.iloc[0]
-    cols = ["tag", "penetration", "Peak demand (MW)", "T_return network (degC)",
+    cols = ["tag", "Peak demand (MW)", "T_return network (degC)",
             "Fossil fuel (GWh)", "Extra CHP electricity (MWh)", "Unmet demand (MWh)"]
     print("\n" + "=" * 90)
     print(summary[cols].to_string(index=False, float_format="{:.3f}".format))
